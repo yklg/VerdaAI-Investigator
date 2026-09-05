@@ -12,13 +12,20 @@ import ExpertDetailPage from './pages/ExpertDetailPage'
 import LibraryPage from './pages/LibraryPage'
 import DashboardPage from './pages/DashboardPage'
 import KnowledgePage from './pages/KnowledgePage'
+import SettingsPage from './pages/SettingsPage'
+import TaskFloatBar from './components/TaskFloatBar'
 import { useExpertStore } from './store/expertStore'
+import { useSettingsStore } from './store/settingsStore'
 
 export default function App() {
   const load = useExpertStore((s) => s.load)
+  const loadSettings = useSettingsStore((s) => s.load)
   useEffect(() => {
     load()
   }, [load])
+  useEffect(() => {
+    loadSettings()
+  }, [loadSettings])
 
   return (
     <BrowserRouter>
@@ -31,6 +38,7 @@ export default function App() {
           <Route path="/experts" element={<ExpertsPage />} />
           <Route path="/experts/:id" element={<ExpertDetailPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
         </Route>
 
         {/* 全屏沉浸页：澄清 / 工作台 / 报告 / 图谱 */}
@@ -42,6 +50,9 @@ export default function App() {
 
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+
+      {/* 全局悬浮任务条：任何页面常驻，返回后仍可找回进行中的调研 */}
+      <TaskFloatBar />
     </BrowserRouter>
   )
 }

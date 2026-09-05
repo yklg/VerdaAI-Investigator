@@ -23,13 +23,14 @@ import re
 import time
 import uuid
 from collections import Counter
+from contextvars import ContextVar
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from app.core import charts as C
 from app.core import db
 from app.core import trace
 from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
-from app.core.config import get_settings
+from app.core.runtime_config import get_effective_settings
 from app.core.credibility import score_evidence, freshness_days
 from app.core.fetcher import domain_of, fetch_page
 from app.core.llm import chat, chat_json, LLMNotConfigured, TOKEN_USAGE
@@ -40,8 +41,6 @@ from app.core.search import multi_search
 from app.core.sentiment import analyze_sentiment, PLATFORM_LABEL, PLATFORM_SITES
 from app.core.textquality import is_relevant_content
 from app.data import expert_by_id, load_experts
-
-_settings = get_settings()
 
 
 def _now() -> str:
@@ -91,32 +90,134 @@ MODE_CONFIG = {
 }
 
 
+# 单条调研任务的「用户指定分析模型」覆盖（仅 core/aux 档生效，fast 杂务不动）。
+# ContextVar 随每个 asyncio pipeline 协程隔离；run_pipeline 入口 set 覆盖式写入，
+# 不同任务之间无串扰（且每次 set 覆盖旧值，无累积）。
+_pipeline_model_override: ContextVar[str] = ContextVar("_pipeline_model_override", default="")
+
+
 def _model(tier: str) -> str:
-    """tier: 'core' | 'aux' | 'fast' → 实际模型名。"""
-    if tier == "core":
-        return _settings.zhipu_model_core
+    """tier: 'core' | 'aux' | 'fast' → 实际模型名。
+
+    每次调用都读运行时有效配置（env 默认 + 界面覆盖），
+    因此用户在「模型配置」改了模型矩阵后下一次调研立即生效，无需重启。
+
+    override：若本次调研用户在 HomePage 指定了分析模型（core/aux 档），
+    则核心章与辅助章统一用该模型；fast 杂务（intake/情感分类/专家指派）
+    始终走 settings.fast，不被覆盖。返回**永远是纯模型名**（直接作 LLM API
+    的 model 参数），绝不带任何后缀——(override) 标注只在 trace 展示层加。
+    """
+    override = _pipeline_model_override.get()
+    s = get_effective_settings()
     if tier == "fast":
-        return _settings.zhipu_model_fast
-    return _settings.zhipu_model_aux
+        # 杂务快速档不受 override 影响，始终按 settings
+        return s.get("llm_model_fast") or ""
+    if override:
+        # 核心章 / 辅助章统一用用户指定的分析模型
+        return override
+    if tier == "core":
+        return s.get("llm_model_core") or ""
+    return s.get("llm_model_aux") or ""
 
 
 # ── 任务创建 / 澄清（落库）─────────────────────────────────
-def create_task(query: str, mode: str = "deep") -> Dict[str, Any]:
+def create_task(query: str, mode: str = "deep", model: Optional[str] = None) -> Dict[str, Any]:
+    """快路径：只落库 task_id + meta，不调 LLM，毫秒级返回。
+
+    澄清问卷改为 ClarifyPage 挂载后通过 SSE 懒生成（见 async generate_clarify），
+    从而把 LLM 推理移出 HTTP 关键路径——这是根治「提交后等好久」的架构根因。
+    """
     task_id = _sid("t")
-    questions = _clarify_questions(query)
-    db.save_task(task_id, query, {"_mode": mode})
-    return {"taskId": task_id, "needClarify": True, "clarifyQuestions": questions}
+    # 用户指定的分析模型仅在非空且非 'Auto' 时记录覆盖（跟随 _mode 写入 task meta，
+    # 经 submit_clarify 透传进 clarifications，run_pipeline 双源读取）。
+    meta: Dict[str, Any] = {"_mode": mode}
+    if model and model != "Auto":
+        meta["_model_override"] = model
+    db.save_task(task_id, query, meta)
+    return {"taskId": task_id}
 
 
 def submit_clarify(task_id: str, answers: Dict[str, Any]) -> Dict[str, Any]:
-    # 保留已存的 _mode
+    # 保留已存的 _mode 与 _model_override（用户在 HomePage 选的模型跟随澄清透传）
     task = db.get_task(task_id) or {}
     prev = task.get("clarifications", {}) or {}
     merged = {**answers}
-    if "_mode" in prev and "_mode" not in merged:
-        merged["_mode"] = prev["_mode"]
+    for key in ("_mode", "_model_override"):
+        if key in prev and key not in merged:
+            merged[key] = prev[key]
     db.update_task_clarify(task_id, merged)
     return {"ok": True}
+
+
+# ── 澄清问卷异步懒生成（SSE 推送；P0 修复：把 LLM 移出 HTTP 关键路径）──
+# 并发去重：同 task_id 仅生成一个，其余协程复用同一在途 future（P1#7）。
+_GEN_INFLIGHT: Dict[str, "asyncio.Future"] = {}
+
+
+def _fallback_clarify_questions(query: str) -> List[Dict[str, Any]]:
+    """LLM 生成失败时的降级静态问卷（不含竞品发现，但流程可继续，P1#5）。"""
+    return [
+        {"id": "focus", "question": "本次调研最看重哪些维度？（可多选）", "type": "multi",
+         "options": ["功能对比", "定价策略", "用户口碑", "市场份额", "SWOT", "舆情趋势",
+                     "技术架构", "增长趋势", "商业模式", "生态壁垒"]},
+        {"id": "perspective", "question": "你希望以什么视角来产出这份报告？", "type": "single",
+         "options": ["产品经理（PM）", "运营（OPS）", "销售", "用户/消费者", "投资人", "通用/综合"]},
+        {"id": "market", "question": "希望聚焦的目标市场或地区？", "type": "single",
+         "options": ["中国大陆", "全球", "北美", "东南亚", "欧洲", "不限"]},
+        {"id": "user", "question": "目标用户群体是？", "type": "single",
+         "options": ["个人用户", "中小团队", "大型企业", "开发者", "学生教育", "不限"]},
+        {"id": "freshness", "question": "是否优先关注最新动态？", "type": "single",
+         "options": ["优先最新（近一月）", "近一年即可", "不限时间"]},
+        {"id": "extra", "question": "有哪些特定竞品、背景或纠正需要我们关注？（选填）",
+         "type": "text", "options": []},
+    ]
+
+
+async def generate_clarify(task_id: str, query: str) -> AsyncIterator[Dict[str, Any]]:
+    """懒生成澄清问卷，SSE 逐事件推送。
+
+    - 通过 asyncio.to_thread 把同步阻塞的 _clarify_questions（含 DeepSeek HTTP）
+      移出事件循环（P0#1），否则 async 路由会阻塞所有并发请求（含并行调研）。
+    - 并发重入防护（P1#7）：首个协程把结果塞进 _GEN_INFLIGHT future，其余协程
+      await 同一 future 复用结果，绝不重复调 LLM。临界区（get DB → 建 future）
+      无 await，单线程内原子，杜绝 double generation。
+    - 生成失败降级为静态问卷（P1#5），流程不卡死。
+    """
+    # 已落库（重连/刷新）：直接推送，避免重复 LLM 调用
+    existing = db.get_clarify_questions(task_id)
+    if existing:
+        yield {"type": "clarify_ready", "data": existing}
+        return
+
+    loop = asyncio.get_running_loop()
+    inflight = _GEN_INFLIGHT.get(task_id)
+    if inflight is not None:
+        # 并发重入：复用在途生成结果，不重复调 LLM
+        questions = await inflight
+        yield {"type": "clarify_ready", "data": {"questions": questions}}
+        return
+
+    fut: "asyncio.Future" = loop.create_future()
+    _GEN_INFLIGHT[task_id] = fut  # 原子写入（其后无 await，其它协程必见）
+    try:
+        yield {"type": "clarify_stage", "data": {"stage": "understanding", "message": "正在理解你的需求…"}}
+        yield {"type": "clarify_stage", "data": {"stage": "discovering", "message": "正在发现竞品…"}}
+        try:
+            questions = await asyncio.to_thread(_clarify_questions, query)
+            degraded = False
+        except Exception:
+            questions = _fallback_clarify_questions(query)
+            degraded = True
+        db.save_clarify_questions(task_id, questions)
+        if not fut.done():
+            fut.set_result(questions)
+        yield {"type": "clarify_ready", "data": {"questions": questions, "degraded": degraded}}
+    except Exception as e:  # noqa: BLE001
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _GEN_INFLIGHT.pop(task_id, None)
 
 
 def refine_section(report_id: str, section_id: str, annotations: List[str]) -> Dict[str, Any]:
@@ -563,8 +664,13 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
 # ── 主流程 ───────────────────────────────────────────────
 async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str, Any]]:
     task = db.get_task(task_id) or {"query": "竞品分析", "clarifications": {}}
-    query = task.get("query", "竞品分析")
     clar = task.get("clarifications", {}) or {}
+    # 双源读取用户指定的分析模型（task meta 顶层 或 clarifications，与 _mode 同处理），
+    # 消除「跳过澄清直接跑」时 override 丢失的脆弱点。set 覆盖式写入：asyncio 每个
+    # pipeline 协程有独立 context，且每次 set 覆盖旧值，不同任务之间无串扰。
+    override = task.get("_model_override") or clar.get("_model_override") or ""
+    _pipeline_model_override.set(override)
+    query = task.get("query", "竞品分析")
     mode = clar.get("_mode", "deep")
     if mode not in MODE_CONFIG:
         mode = "deep"

@@ -8,8 +8,11 @@ import {
   Sprout,
   ChevronDown,
   Library,
+  Settings,
+  Activity,
 } from 'lucide-react'
 import { fetchDashboard } from '../lib/api'
+import { useTaskRegistry, selectRunning } from '../store/taskRegistry'
 
 const navItems = [
   { to: '/', label: '工作台', icon: Home, end: true },
@@ -23,6 +26,7 @@ export default function VSidebar() {
   const navigate = useNavigate()
   const [reports, setReports] = useState(0)
   const [evidence, setEvidence] = useState(0)
+  const running = useTaskRegistry(selectRunning)
 
   useEffect(() => {
     fetchDashboard().then((d) => {
@@ -68,6 +72,45 @@ export default function VSidebar() {
             <span>{item.label}</span>
           </NavLink>
         ))}
+
+        {/* 进行中的任务：有后台运行任务时显示，带脉冲点，点击回工作台 */}
+        {running.length > 0 && (
+          <NavLink
+            to={`/workspace/${running[0].taskId}`}
+            className={({ isActive }) =>
+              [
+                'relative flex h-11 items-center gap-3 rounded-btn px-3.5 text-[15px] transition-all ease-verda',
+                isActive
+                  ? 'bg-primary-tint font-medium text-primary-deep'
+                  : 'text-primary hover:bg-primary-tint/50',
+              ].join(' ')
+            }
+          >
+            <span className="relative grid place-items-center">
+              <Activity size={19} strokeWidth={1.8} />
+              <span className="absolute -right-0.5 -top-0.5 h-2 w-2 animate-pulse rounded-full bg-ok ring-2 ring-card" />
+            </span>
+            <span className="flex-1 truncate">进行中的任务</span>
+            <span className="text-tag font-medium text-primary-deep">{running[0].percent}%</span>
+          </NavLink>
+        )}
+
+        {/* 分隔线 + 系统设置入口（与业务导航区分） */}
+        <div className="mb-1 mt-3 h-px bg-line" />
+        <NavLink
+          to="/settings"
+          className={({ isActive }) =>
+            [
+              'flex h-11 items-center gap-3 rounded-btn px-3.5 text-[15px] transition-all ease-verda',
+              isActive
+                ? 'bg-primary-tint font-medium text-primary-deep'
+                : 'text-ink-2 hover:bg-primary-tint/50',
+            ].join(' ')
+          }
+        >
+          <Settings size={19} strokeWidth={1.8} />
+          <span>模型配置</span>
+        </NavLink>
       </nav>
 
       {/* 工作空间用量卡片 */}

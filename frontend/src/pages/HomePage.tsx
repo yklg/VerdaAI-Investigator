@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useMemo, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
 import {
@@ -21,8 +21,8 @@ import { fadeUp, stagger } from '../lib/motion'
 import { useUIStore } from '../store/uiStore'
 import { useExpertStore } from '../store/expertStore'
 import { createTask } from '../lib/api'
-
-const MODELS = ['Auto', 'GLM-5.2', 'GLM-5.1', 'GLM-Z1-Air', 'GLM-4-Plus']
+import { useSettingsStore } from '../store/settingsStore'
+import { findProviderByBaseUrl } from '../lib/llmProviders'
 
 const MODE_OPTIONS = [
   { key: 'quick', icon: Zap, label: '快速', desc: '5 章 · 约 2 分钟 · 速览' },
@@ -60,6 +60,30 @@ const EXAMPLES = [
 function ModelPicker() {
   const [open, setOpen] = useState(false)
   const { model, setModel } = useUIStore()
+  const resp = useSettingsStore((s) => s.resp)
+
+  // 选项 = Auto + 当前已保存的 4 个模型字段 + 命中厂商预设的候选模型（去重合并）。
+  // 随 SettingsPage 保存实时刷新（store.load 后 resp 更新）。
+  const options = useMemo<string[]>(() => {
+    if (!resp) return ['Auto']
+    const fromValues = (
+      ['llm_model', 'llm_model_core', 'llm_model_aux', 'llm_model_fast'] as const
+    )
+      .map((k) => resp.values[k])
+      .filter((v): v is string => typeof v === 'string' && v !== '')
+    const preset = findProviderByBaseUrl(String(resp.values.llm_base_url ?? ''))
+    const fromPreset = preset?.models ?? []
+    return ['Auto', ...Array.from(new Set([...fromValues, ...fromPreset]))]
+  }, [resp])
+
+  const defaultModel = resp?.values.llm_model
+  const label =
+    model === 'Auto'
+      ? defaultModel
+        ? `切换模型 · 默认 ${defaultModel}`
+        : '切换模型'
+      : model
+
   return (
     <div className="relative">
       <button
@@ -69,7 +93,7 @@ function ModelPicker() {
         className="inline-flex items-center gap-1.5 px-3 h-9 rounded-chip bg-primary-tint text-primary-deep text-aux font-medium hover:bg-primary-soft/40 transition-colors"
       >
         <Cpu size={15} />
-        <span className="max-w-[120px] truncate">{model === 'Auto' ? '切换模型' : model}</span>
+        <span className="max-w-[160px] truncate">{label}</span>
         <ChevronDown size={15} />
       </button>
       {open && (
@@ -77,7 +101,7 @@ function ModelPicker() {
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div className="absolute bottom-11 right-0 z-20 w-56 rounded-btn bg-card shadow-float border border-line p-1">
             <div className="px-3 pb-1 pt-1.5 text-tag text-ink-3">选择分析模型</div>
-            {MODELS.map((m) => (
+            {options.map((m) => (
               <button
                 key={m}
                 onClick={() => {
@@ -113,9 +137,12 @@ export default function HomePage() {
     if (!query || submitting) return
     setSubmitting(true)
     try {
-      const resp = await createTask(query, mode)
-      if (resp.needClarify) navigate(`/clarify/${resp.taskId}`, { state: { query, clarify: resp.clarifyQuestions } })
-      else navigate(`/workspace/${resp.taskId}`, { state: { query } })
+      // Auto = 不覆盖（走 settings 编排）；否则把用户选的模型透传后端 override
+      const selectedModel = useUIStore.getState().model
+      const modelOverride = selectedModel !== 'Auto' ? selectedModel : null
+      const resp = await createTask(query, mode, modelOverride)
+      // 永远进 clarify：问卷在 ClarifyPage 内通过 SSE 懒生成（根治「提交后等好久」）
+      navigate(`/clarify/${resp.taskId}`, { state: { query } })
     } finally {
       setSubmitting(false)
     }

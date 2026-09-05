@@ -109,3 +109,65 @@ export function VCountUp({ value, className = '' }: { value: number; className?:
 export function VSkeleton({ className = '' }: { className?: string }) {
   return <div className={`v-skeleton ${className}`} />
 }
+
+/* ── 通用弹窗 VModal（SettingsPage 弹窗化首用，未来可复用） ──
+   结构：遮罩（点击关闭）+ 居中卡（标题行 + 内容体）。
+   约束：
+   - 内容体 overflow-hidden，纵向滚动由消费方内容区自行控制
+     （惯例：children 根节点给 `flex h-full`，右内容区给 overflow-y-auto）；
+   - 打开期间锁 body 滚动，关闭时还原前值（防多实例互踩）；Esc 关闭。 */
+export function VModal({
+  open,
+  onClose,
+  title,
+  width = 780,
+  children,
+}: {
+  open: boolean
+  onClose: () => void
+  title: ReactNode
+  width?: number
+  children: ReactNode
+}) {
+  useEffect(() => {
+    if (!open) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = prev
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open, onClose])
+
+  if (!open) return null
+  return (
+    <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label={typeof title === 'string' ? title : undefined}>
+      {/* 遮罩：点击关闭 */}
+      <div className="absolute inset-0 bg-ink/40 backdrop-blur-[2px]" onClick={onClose} />
+      {/* 居中卡：固定高度避免切 tab 时 content-driven 伸缩；h-[min(720px,85vh)] 兼顾小屏与桌面 */}
+      <div
+        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex h-[min(720px,85vh)] flex-col bg-card shadow-float border border-line/60 rounded-card"
+        style={{ width, maxWidth: 'calc(100vw - 32px)' }}
+      >
+        {/* 标题行 */}
+        <div className="flex shrink-0 items-center justify-between gap-4 border-b border-line/50 px-6 py-4">
+          <div className="truncate text-base font-semibold text-ink">{title}</div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="关闭"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-btn text-xl leading-none text-ink-2 transition-colors duration-200 ease-verda hover:bg-primary-tint hover:text-primary-deep"
+          >
+            ×
+          </button>
+        </div>
+        {/* 内容体：overflow-hidden + overflow-y-scroll 让滚动条轨道常驻，切 tab 时右 pane 宽度恒定防抽搐 */}
+        <div className="min-h-0 flex-1 overflow-hidden overflow-y-scroll">{children}</div>
+      </div>
+    </div>
+  )
+}

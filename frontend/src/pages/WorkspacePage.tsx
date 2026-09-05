@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useTaskStream } from '../hooks/useTaskStream'
 import { useTaskStore } from '../store/taskStore'
+import { useTaskRegistry } from '../store/taskRegistry'
 import { useExpertStore } from '../store/expertStore'
 import { VFlowDag } from '../components/VFlowDag'
 import { VAgentStream } from '../components/VAgentStream'
@@ -40,8 +41,11 @@ export default function WorkspacePage() {
     reportId,
     finished,
     error,
+    query: storeQuery,
   } = useTaskStore()
   const byId = useExpertStore((s) => s.byId)
+  const upsertTask = useTaskRegistry((s) => s.upsert)
+  const displayQuery = storeQuery || query
 
   const reworkMsg = messages.find((m) => m.kind === 'rework')
 
@@ -58,7 +62,20 @@ export default function WorkspacePage() {
       {/* 顶栏 */}
       <header className="flex h-14 shrink-0 items-center gap-3 border-b border-line bg-card/80 px-5 backdrop-blur">
         <button
-          onClick={() => navigate('/')}
+          onClick={() => {
+            // 返回 = 收起到后台运行：任务仍在后端跑，悬浮条接管；不再硬杀连接
+            if (taskId) {
+              upsertTask({
+                taskId,
+                query: displayQuery,
+                status: 'running',
+                startedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              })
+            }
+            navigate('/')
+          }}
+          title="收起到后台运行（调研继续）"
           className="grid h-9 w-9 place-items-center rounded-btn text-ink-2 transition-colors hover:bg-primary-tint hover:text-primary-deep"
         >
           <ChevronLeft size={20} />
@@ -67,7 +84,7 @@ export default function WorkspacePage() {
           <Sprout size={18} strokeWidth={1.8} />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-aux font-medium text-ink">{query || '竞品分析任务'}</div>
+          <div className="truncate text-aux font-medium text-ink">{displayQuery || '竞品分析任务'}</div>
           <div className="text-tag text-ink-3">任务 {taskId}</div>
         </div>
         {/* 进度 */}

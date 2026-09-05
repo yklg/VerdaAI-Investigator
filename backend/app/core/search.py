@@ -14,7 +14,7 @@ from typing import List, Optional
 
 import httpx
 
-from app.core.config import get_settings
+from app.core.runtime_config import get_effective_settings
 
 # 博查异常码 → 人话提示
 _BOCHA_ERR = {
@@ -82,9 +82,9 @@ def search_bocha(
     - 返回的每条都带 title + url + snippet + source + captured_at，便于后续抓取正文。
     - 自动做相关性过滤，剔除明显不相关的结果。
     """
-    settings = get_settings()
-    if not settings.bocha_api_key:
-        raise RuntimeError("未配置 BOCHA_API_KEY，搜索暂不可用")
+    settings = get_effective_settings()
+    if not settings.get("bocha_api_key"):
+        raise RuntimeError("未配置 BOCHA_API_KEY，请在「模型配置」页面填写后重试")
 
     # count 取值范围 1-50
     count = max(1, min(int(num), 50))
@@ -100,14 +100,14 @@ def search_bocha(
         # 博查用 include 限定网站范围（多个用 | 分隔）
         payload["include"] = site
 
-    endpoint = f"{settings.bocha_base_url.rstrip('/')}/web-search"
+    endpoint = f"{str(settings.get('bocha_base_url') or '').rstrip('/')}/web-search"
     headers = {
-        "Authorization": f"Bearer {settings.bocha_api_key}",
+        "Authorization": f"Bearer {settings.get('bocha_api_key')}",
         "Content-Type": "application/json",
     }
 
     timeout = httpx.Timeout(
-        connect=8, read=settings.search_timeout, write=5, pool=5
+        connect=8, read=float(settings.get("search_timeout") or 30), write=5, pool=5
     )
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         r = client.post(endpoint, headers=headers, json=payload)

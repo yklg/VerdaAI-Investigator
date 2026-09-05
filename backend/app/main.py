@@ -6,24 +6,50 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core import db
-from app.core.config import get_settings
 from app.core.llm import LLMNotConfigured, chat
-from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section
+from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section, generate_clarify
+from app.core import runner
+from app.core.runtime_config import (
+    GROUP_FIELDS,
+    SECRET_KEYS,
+    SettingsValidationError,
+    apply_settings,
+    configured_flags,
+    get_effective_settings,
+    mask_effective,
+    migrate_legacy_settings,
+    migrate_model_values,
+)
 from app.core.search import search
 from app.data import expert_by_id, load_experts
 
-settings = get_settings()
 
-app = FastAPI(title="青野 Verda API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """启动编排：配置键迁移（键名泛化 zhipu_* → llm_*）显式执行，fail-fast。
+
+    并回收孤儿 running：进程重启后内存里的实时任务已丢，DB 仍标记 running 会
+    让前端悬浮条永久转圈，这里统一标 failed。
+    """
+    migrate_legacy_settings()
+    migrate_model_values()
+    runner.reconcile_orphans()
+    yield
+
+
+app = FastAPI(title="青野 Verda API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,14 +67,17 @@ def root():
         "name": "青野 Verda API",
         "version": "2.0.0",
         "slogan": "让每个结论都有出处，让每次调研都活着。",
-        "llm_configured": settings.llm_configured,
+        "llm_configured": bool(get_effective_settings().get("llm_api_key")),
         "experts": len(load_experts()),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "llm_configured": settings.llm_configured}
+    return {
+        "status": "ok",
+        "llm_configured": bool(get_effective_settings().get("llm_api_key")),
+    }
 
 
 @app.get("/api/llm/ping")
@@ -61,11 +90,83 @@ def llm_ping():
             ],
             max_tokens=200,
         )
-        return {"ok": True, "model": settings.zhipu_model, "reply": reply.strip()}
+        return {
+            "ok": True,
+            "model": get_effective_settings().get("llm_model"),
+            "reply": reply.strip(),
+        }
     except LLMNotConfigured as e:
         return {"ok": False, "reason": "not_configured", "message": str(e)}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "error", "message": str(e)}
+
+
+@app.get("/api/llm/models")
+def list_provider_models():
+    """运行时从厂商拉取模型列表（enrichment layer）。
+
+    仅服务端读取已保存的 llm_base_url + llm_api_key，密钥不出服务端、不回传前端。
+    失败（未配置 / 网络 / 401 / 非标准响应）→ 返回 ok:false，前端静默回退硬编码预设。
+    """
+    eff = get_effective_settings()
+    base = eff.get("llm_base_url")
+    key = eff.get("llm_api_key")
+    if not base or not key:
+        return {"ok": False, "reason": "no-credential"}
+    try:
+        r = httpx.get(
+            f"{base.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        ids = [m["id"] for m in data if isinstance(m, dict) and m.get("id")]
+        return {"ok": True, "models": ids}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "fetch_failed"}
+
+
+# ── 运行时配置（供「模型配置」页使用）─────────────────────
+class SettingsPatch(BaseModel):
+    patch: Dict[str, Any] = {}
+
+
+@app.get("/api/settings")
+def get_settings_api():
+    """返回脱敏后的有效配置 + 分组结构 + 各能力是否已配置。
+
+    密钥字段一律返回脱敏值（如 sk-****9f2a），绝不明文回传。
+    """
+    eff = get_effective_settings()
+    return {
+        "ok": True,
+        "values": mask_effective(eff),
+        "secrets": sorted(SECRET_KEYS),
+        "groups": GROUP_FIELDS,
+        "configured": configured_flags(eff),
+    }
+
+
+@app.put("/api/settings")
+def put_settings_api(body: SettingsPatch):
+    """保存运行时配置覆盖：校验 → 落库 → 失效缓存与 LLM 客户端。
+
+    - 密钥字段传空字符串 = 保留原值（不修改）。
+    - 未知键被忽略。
+    - 类型转换失败：整包 422，附带字段级错误信息。
+    保存后下一次 LLM/搜索调用即生效，无需重启。
+    """
+    try:
+        eff = apply_settings(body.patch or {})
+    except SettingsValidationError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors})
+    return {
+        "ok": True,
+        "values": mask_effective(eff),
+        "configured": configured_flags(eff),
+    }
 
 
 @app.get("/api/search")
@@ -118,11 +219,12 @@ def get_expert(eid: str):
 class CreateTaskBody(BaseModel):
     query: str
     mode: str = "deep"  # quick | deep | expert
+    model: Optional[str] = None  # 用户选择的分析模型；空/'Auto'/None 表示按 settings 编排
 
 
 @app.post("/api/tasks")
 def post_task(body: CreateTaskBody):
-    return create_task(body.query, mode=body.mode)
+    return create_task(body.query, mode=body.mode, model=body.model)
 
 
 class ClarifyBody(BaseModel):
@@ -134,17 +236,72 @@ def post_clarify(task_id: str, body: ClarifyBody):
     return submit_clarify(task_id, body.answers)
 
 
-# ── SSE 思维流 ──────────────────────────────────────────
+# ── SSE 思维流（纯订阅者；执行由 runner 后台常驻，断连只撤订阅不杀任务）─
 @app.get("/api/tasks/{task_id}/stream")
 async def stream_task(task_id: str, request: Request, sub_id: str = ""):
+    runner.ensure_running(task_id)  # 首次连接触发执行；重连只订阅
+
     async def gen():
         try:
-            async for ev in run_pipeline(task_id, sub_id=sub_id):
+            async for ev in runner.subscribe(task_id):
                 if await request.is_disconnected():
-                    break
+                    break  # 仅断订阅，pipeline 继续在后台跑
                 etype = ev["type"]
                 data = json.dumps(ev["data"], ensure_ascii=False)
                 yield f"event: {etype}\ndata: {data}\n\n"
+        except asyncio.CancelledError:
+            pass  # 客户端断开，订阅协程被取消属正常
+        except Exception as e:  # noqa: BLE001
+            err = json.dumps({"message": str(e)}, ensure_ascii=False)
+            yield f"event: error\ndata: {err}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── 任务运行态查询 / 列表 / 取消（前端悬浮条 + 侧栏入口 + 返回语义依赖）──
+@app.get("/api/tasks/{task_id}/status")
+def task_status(task_id: str):
+    """实时进度与状态；断连后仍在后台跑，此接口可持续返回 running + 增长 percent。"""
+    return runner.get_status(task_id)
+
+
+@app.get("/api/tasks/running")
+def tasks_running():
+    """进行中的任务列表（供侧栏/悬浮条入口）。"""
+    return runner.list_running()
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def task_cancel(task_id: str):
+    """取消进行中的任务（前端返回语义的兜底，正常返回不取消）。"""
+    runner.cancel(task_id)
+    return {"ok": True}
+
+
+# ── 澄清问卷 SSE（懒生成；create_task 不再同步调 LLM）─────────
+@app.get("/api/tasks/{task_id}/clarify/stream")
+async def stream_clarify(task_id: str, request: Request):
+    async def gen():
+        # 重连/刷新：DB 已有则直接推送，避免重复 LLM 调用（P1 重连直读）
+        existing = db.get_clarify_questions(task_id)
+        if existing:
+            yield f"event: clarify_ready\ndata: {json.dumps(existing, ensure_ascii=False)}\n\n"
+            return
+        task = db.get_task(task_id)
+        query = (task or {}).get("query", "") if task else ""
+        try:
+            async for ev in generate_clarify(task_id, query):
+                if await request.is_disconnected():
+                    break
+                yield f"event: {ev['type']}\ndata: {json.dumps(ev['data'], ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
             err = json.dumps({"message": str(e)}, ensure_ascii=False)
             yield f"event: error\ndata: {err}\n\n"

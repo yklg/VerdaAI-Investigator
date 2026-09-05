@@ -114,3 +114,9 @@ coverage/
 # package-lock.json 通常提交；如有安全顾虑可在此取消注释
 # package-lock.json
 # yarn.lock
+
+# ============== AI 工具内部目录（含本地工作记忆，禁止提交） ==============
+.workbuddy/
+
+# ============== 本地脚本 / 一次性工具（非项目源码，禁止提交） ==============
+setup-github-sync.sh

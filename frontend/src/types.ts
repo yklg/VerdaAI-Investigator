@@ -33,8 +33,6 @@ export interface ClarifyQuestion {
 }
 export interface CreateTaskResp {
   taskId: string
-  needClarify: boolean
-  clarifyQuestions?: ClarifyQuestion[]
 }
 
 /* SSE 事件 */
@@ -50,6 +48,15 @@ export type SSEEventType =
   | 'report_ready'
   | 'done'
   | 'error'
+
+/* 澄清问卷 SSE 事件（CreateTaskResp 不再携带问卷，改为 ClarifyPage 内 SSE 懒加载） */
+export type ClarifySSEEventType = 'clarify_stage' | 'clarify_ready' | 'error'
+
+export interface ClarifySSEHandlers {
+  onEvent: (type: ClarifySSEEventType, data: unknown) => void
+  onError?: (e: unknown) => void
+  onOpen?: () => void
+}
 
 /* 可观测性 Trace Span */
 export interface TraceSpan {
@@ -333,3 +340,32 @@ export interface ExpertWorkload {
   evidence_collected: number
   last_active: string
 }
+
+/* ── 模型配置（运行时可覆盖配置）─────────────────────────
+   优先级：界面设置 > .env 默认值。密钥字段 GET 时一律为脱敏值。 */
+export type SettingsGroupKey =
+  | 'provider'
+  | 'model_matrix'
+  | 'params'
+  | 'search'
+  | 'platform'
+
+export type SettingsValues = Record<string, string | number | boolean>
+
+export interface SettingsConfigured {
+  llm: boolean
+  bocha: boolean
+}
+
+export interface SettingsResp {
+  ok: boolean
+  /** 脱敏后的有效配置（密钥为 sk-****xxxx 形式） */
+  values: SettingsValues
+  /** 哪些键属于密钥（前端据此渲染密码框 + 留空不改） */
+  secrets: string[]
+  /** 分组 → 字段列表，供前端按组渲染表单 */
+  groups: Record<string, string[]>
+  configured: SettingsConfigured
+}
+
+export type SaveSettingsResp = Omit<SettingsResp, 'secrets' | 'groups'>

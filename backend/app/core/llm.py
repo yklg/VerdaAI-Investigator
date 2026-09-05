@@ -1,6 +1,6 @@
-"""智谱 GLM LLM 客户端封装（默认 glm-5-turbo，走 BigModel OpenAI 兼容网关）。
+"""LLM 客户端封装（OpenAI 兼容协议，默认智谱 GLM，走 BigModel 兼容网关）。
 
-- 模型 / APIKEY 走环境变量，不硬编码、不外泄（第 16.4 章）。
+- 模型 / APIKEY 走 env + 运行时配置（llm_* 键，厂商无关），不硬编码、不外泄（第 16.4 章）。
 - 支持普通 chat 与流式 chat（供思维流 SSE 使用）。
 - chat/chat_json/chat_stream 均支持 model 参数覆盖默认模型（多模型并行调度用）。
 - 每次 chat() 调用自动记录 trace span（无侵入埋点，见 trace.py）。
@@ -15,15 +15,25 @@ from typing import Any, Iterator, Optional
 
 from openai import OpenAI
 
-from app.core.config import get_settings
 from app.core import trace
+from app.core.runtime_config import get_effective_settings
 
 
 class LLMNotConfigured(RuntimeError):
-    """未配置 ZHIPU_API_KEY。"""
+    """未配置 LLM API Key。"""
 
 
 _client: OpenAI | None = None
+# 客户端签名：记录建客户端时用的配置。签名变化即重建，
+# 使界面改配置后**无需重启**立即生效（根治 RC2）。
+_client_sig: tuple | None = None
+
+
+def invalidate_client() -> None:
+    """配置变更后调用：丢弃缓存客户端，下次 _get_client() 用新配置重建。"""
+    global _client, _client_sig
+    _client = None
+    _client_sig = None
 
 # 进程级 token 计数（供 progress 真实上报）
 TOKEN_USAGE = {"total": 0}
@@ -38,19 +48,32 @@ def _is_rate_limit(err: Exception) -> bool:
 
 
 def _get_client() -> OpenAI:
-    global _client
-    settings = get_settings()
-    if not settings.zhipu_api_key:
+    """按 (key, base_url, timeout, retries) 签名缓存客户端。
+
+    签名不变则复用（省去重复建连开销）；签名变化则重建，
+    因此界面保存配置后下一次 LLM 调用即走新配置，无需重启进程。
+    """
+    global _client, _client_sig
+    s = get_effective_settings()
+    if not s.get("llm_api_key"):
         raise LLMNotConfigured(
-            "未配置 ZHIPU_API_KEY，请在 backend/.env 中填写智谱开放平台 API Key。"
+            "未配置 LLM API Key，请在「模型配置」页面选择服务商后粘贴，或写入 backend/.env 的 "
+            "LLM_API_KEY（旧名 ZHIPU_API_KEY 仍兼容）。"
         )
-    if _client is None:
+    sig = (
+        s.get("llm_api_key"),
+        s.get("llm_base_url"),
+        float(s.get("llm_timeout") or 180),
+        int(s.get("llm_max_retries") or 0),
+    )
+    if _client is None or _client_sig != sig:
         _client = OpenAI(
-            api_key=settings.zhipu_api_key,
-            base_url=settings.zhipu_base_url,
-            timeout=settings.llm_timeout,
-            max_retries=settings.llm_max_retries,
+            api_key=sig[0],
+            base_url=sig[1],
+            timeout=sig[2],
+            max_retries=sig[3],
         )
+        _client_sig = sig
     return _client
 
 
@@ -87,10 +110,9 @@ def chat(
         model: 可选，覆盖配置中的默认模型（用于多模型并行调度）。
         purpose/evidence_ids: 可选，补充到 trace span（便于决策回放）。
     """
-    settings = get_settings()
     client = _get_client()
     last_err: Exception | None = None
-    use_model = model or settings.zhipu_model
+    use_model = model or get_effective_settings().get("llm_model")
     for delay in [0.0] + _RATE_LIMIT_BACKOFFS:
         if delay:
             time.sleep(delay)
@@ -204,9 +226,8 @@ def chat_stream(
     model: str | None = None,
 ) -> Iterator[str]:
     """流式返回文本增量（供思维流逐条 append）。"""
-    settings = get_settings()
     client = _get_client()
-    use_model = model or settings.zhipu_model
+    use_model = model or get_effective_settings().get("llm_model")
     stream = client.chat.completions.create(
         model=use_model,
         messages=messages,  # type: ignore[arg-type]

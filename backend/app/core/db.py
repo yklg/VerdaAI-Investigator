@@ -86,7 +86,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             clarifications TEXT,
             status TEXT,
             created_at TEXT,
-            report_id TEXT
+            report_id TEXT,
+            clarify_questions TEXT
         );
         CREATE TABLE IF NOT EXISTS reports (
             report_id TEXT PRIMARY KEY,
@@ -158,9 +159,114 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             data TEXT,
             updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT
+        );
         """
     )
     conn.commit()
+    # 迁移：存量库 tasks 表可能缺 clarify_questions 列（旧库不自动加列）。
+    # CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，这里显式 ALTER 补齐，
+    # 带列存在性检查，可重复执行（幂等）。
+    try:
+        # 按位置取列名（cid,name,type,...），不依赖调用方的 row_factory，兼容任意连接
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "clarify_questions" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN clarify_questions TEXT")
+            conn.commit()
+        # 运行态扩展列（后台常驻重构）：让「运行中的任务」成为一等实体。
+        # 幂等补齐，旧库重复执行无副作用。
+        for col, coltype in (
+            ("stage", "TEXT"),
+            ("percent", "INTEGER"),
+            ("evidence_count", "INTEGER"),
+            ("started_at", "TEXT"),
+            ("updated_at", "TEXT"),
+            ("error", "TEXT"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype}")
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
+# ── 运行时配置（DB 覆盖层）──────────────────────────────
+# 只存「用户在界面上改过的键」；未改的键回落 env 默认值（见 core/runtime_config.py）。
+def get_setting(key: str) -> Optional[str]:
+    """读取单个键的运行时覆盖值；不存在返回 None（表示「未覆盖」）。"""
+    c = _connect()
+    row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    """写入/更新单个键的运行时覆盖值。value 一律以字符串落库，类型由 SCHEMA 负责还原。"""
+    with _LOCK:
+        c = _connect()
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key,value,updated_at) VALUES(?,?,?)",
+            (key, str(value), _now()),
+        )
+        c.commit()
+
+
+def get_all_settings() -> Dict[str, str]:
+    """一次性取出全部覆盖值（避免逐键查询的 N 次往返）。"""
+    c = _connect()
+    return {r["key"]: r["value"] for r in c.execute("SELECT key,value FROM settings")}
+
+
+def clear_settings() -> None:
+    """清空所有运行时覆盖，完全回落 env 默认。"""
+    with _LOCK:
+        c = _connect()
+        c.execute("DELETE FROM settings")
+        c.commit()
+
+
+def delete_setting(key: str) -> None:
+    """删除单个键的运行时覆盖。"""
+    with _LOCK:
+        c = _connect()
+        c.execute("DELETE FROM settings WHERE key=?", (key,))
+        c.commit()
+
+
+def migrate_settings(mapping: Dict[str, str]) -> int:
+    """运行时配置键迁移（如键名泛化 zhipu_* → llm_*）：单事务把旧键搬到新键。
+
+    - 新键已存在（用户已在新键名下保存过）→ **跳过不覆盖**，仅删除旧键。
+    - 幂等：可重复执行，无旧键时 no-op。
+    返回：本次处理的旧键数。
+    """
+    moved = 0
+    with _LOCK:
+        c = _connect()
+        try:
+            for old, new in mapping.items():
+                row = c.execute(
+                    "SELECT value FROM settings WHERE key=?", (old,)
+                ).fetchone()
+                if row is None:
+                    continue
+                exists = c.execute(
+                    "SELECT 1 FROM settings WHERE key=?", (new,)
+                ).fetchone()
+                if exists is None:
+                    c.execute(
+                        "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)",
+                        (new, row["value"], _now()),
+                    )
+                c.execute("DELETE FROM settings WHERE key=?", (old,))
+                moved += 1
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+    return moved
 
 
 # ── 任务 ────────────────────────────────────────────────
@@ -203,6 +309,112 @@ def mark_task_done(task_id: str, report_id: str) -> None:
             (report_id, task_id),
         )
         c.commit()
+
+
+def set_task_running(task_id: str) -> None:
+    """任务进入执行态（后台常驻重构：与 SSE 连接生命周期解耦）。"""
+    with _LOCK:
+        c = _connect()
+        c.execute(
+            "UPDATE tasks SET status='running', started_at=?, updated_at=? WHERE task_id=?",
+            (_now(), _now(), task_id),
+        )
+        c.commit()
+
+
+def patch_task_progress(task_id: str, percent: int, stage: str, evidence_count: int) -> None:
+    """滚动更新进度（由 runner 从 progress 事件抽取落库，执行引擎不感知传输层）。"""
+    with _LOCK:
+        c = _connect()
+        c.execute(
+            "UPDATE tasks SET percent=?, stage=?, evidence_count=?, updated_at=? WHERE task_id=?",
+            (percent, stage, evidence_count, _now(), task_id),
+        )
+        c.commit()
+
+
+def set_task_failed(task_id: str, error: str) -> None:
+    with _LOCK:
+        c = _connect()
+        c.execute(
+            "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE task_id=?",
+            (error[:500], _now(), task_id),
+        )
+        c.commit()
+
+
+def get_task_full(task_id: str) -> Optional[Dict[str, Any]]:
+    """含运行态扩展列；缺列时回落默认值，兼容未迁移的旧库。"""
+    c = _connect()
+    row = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["clarifications"] = json.loads(d.get("clarifications") or "{}")
+    return d
+
+
+def list_running_tasks() -> List[Dict[str, Any]]:
+    """进行中的任务（供侧栏/悬浮条入口），不含长文。"""
+    c = _connect()
+    rows = c.execute(
+        "SELECT task_id, query, status, percent, stage, evidence_count, started_at, updated_at"
+        " FROM tasks WHERE status IN ('running') ORDER BY updated_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def reconcile_orphan_runs() -> int:
+    """进程重启后，DB 里仍标记 running 但内存已无句柄的任务 → 标 failed，避免悬浮条永久转圈。
+
+    返回被修正的条数。
+    """
+    with _LOCK:
+        c = _connect()
+        cur = c.execute(
+            "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE status='running'",
+            ("进程重启，任务已中断，请重新发起调研", _now()),
+        )
+        n = cur.rowcount
+        c.commit()
+        return n
+
+
+# ── 澄清问卷（懒生成，SSE 推送给前端）─────────────────────
+def save_clarify_questions(task_id: str, questions: List[Dict[str, Any]]) -> None:
+    """落库懒生成的澄清问卷；payload 统一为 {"questions": [...]}（与 SSE clarify_ready 一致）。"""
+    payload = json.dumps({"questions": questions}, ensure_ascii=False)
+    with _LOCK:
+        c = _connect()
+        cur = c.execute(
+            "UPDATE tasks SET clarify_questions=? WHERE task_id=?",
+            (payload, task_id),
+        )
+        if cur.rowcount == 0:
+            # 极端情况：task 尚未落库（理论 create_task 先于 SSE 调用，这里兜底）
+            c.execute(
+                "INSERT INTO tasks(task_id,query,clarifications,status,created_at,report_id,clarify_questions)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (task_id, "", "{}", "created", _now(), None, payload),
+            )
+        c.commit()
+
+
+def get_clarify_questions(task_id: str) -> Optional[Dict[str, Any]]:
+    """读取已生成的澄清问卷；未生成/为空返回 None（SSE 据此决定重新生成）。"""
+    c = _connect()
+    row = c.execute(
+        "SELECT clarify_questions FROM tasks WHERE task_id=?", (task_id,)
+    ).fetchone()
+    if not row:
+        return None
+    raw = row["clarify_questions"]
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 # ── 报告 + 证据 ─────────────────────────────────────────

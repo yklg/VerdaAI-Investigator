@@ -1,5 +1,7 @@
 import type {
   CreateTaskResp,
+  ClarifySSEHandlers,
+  ClarifySSEEventType,
   DashboardStats,
   EvidenceQueryResp,
   Expert,
@@ -7,7 +9,10 @@ import type {
   Report,
   ReportCard,
   ReportSection,
+  SaveSettingsResp,
   SSEEventType,
+  SettingsResp,
+  SettingsValues,
   Subscription,
   TraceSpan,
 } from '../types'
@@ -41,15 +46,65 @@ export async function fetchExperts(): Promise<Expert[]> {
   return (await local.json()) as Expert[]
 }
 
-export async function createTask(query: string, mode: string = 'deep'): Promise<CreateTaskResp> {
+/* ── 模型配置 ─────────────────────────────────────────── */
+
+/** 读取运行时配置（密钥已脱敏）。后端不可用时返回 null，由页面显示降级提示。 */
+export async function fetchSettings(): Promise<SettingsResp | null> {
+  try {
+    const r = await fetch(`${API_BASE}/api/settings`)
+    if (!r.ok) return null
+    return (await r.json()) as SettingsResp
+  } catch {
+    return null
+  }
+}
+
+/** 保存配置覆盖。密钥传空串 = 保留原值。校验失败抛带 errors 的 Error。 */
+export async function saveSettings(patch: SettingsValues): Promise<SaveSettingsResp> {
+  const r = await fetch(`${API_BASE}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ patch }),
+  })
+  const data = await r.json().catch(() => ({}))
+  if (!r.ok) {
+    // 422 整包校验失败：detail.errors 为 { 字段: 错误信息 }
+    const errors = (data as { detail?: { errors?: Record<string, string> } })?.detail?.errors
+    const msg = errors
+      ? Object.entries(errors)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join('\n')
+      : `保存失败（HTTP ${r.status}）`
+    const err = new Error(msg) as Error & { fieldErrors?: Record<string, string> }
+    err.fieldErrors = errors
+    throw err
+  }
+  return data as SaveSettingsResp
+}
+
+/** 连接测试：调 /api/llm/ping 验证当前 Key 是否可用。 */
+export async function pingLLM(): Promise<{
+  ok: boolean
+  model?: string
+  message?: string
+}> {
+  try {
+    const r = await fetch(`${API_BASE}/api/llm/ping`)
+    return (await r.json()) as { ok: boolean; model?: string; message?: string }
+  } catch (e) {
+    return { ok: false, message: String(e) }
+  }
+}
+
+export async function createTask(query: string, mode: string = 'deep', model?: string | null): Promise<CreateTaskResp> {
   return safeJson<CreateTaskResp>(
     '/api/tasks',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, mode }),
+      body: JSON.stringify({ query, mode, model: model ?? null }),
     },
-    { taskId: `demo-${Date.now()}`, needClarify: false },
+    { taskId: `demo-${Date.now()}` },
   )
 }
 
@@ -206,4 +261,66 @@ export function openTaskStream(taskId: string, handlers: SSEHandlers): () => voi
   return () => es.close()
 }
 
+/* 澄清问卷 SSE：CreateTaskResp 不再带问卷，ClarifyPage 挂载后拉取并懒生成。 */
+export function openClarifyStream(taskId: string, handlers: ClarifySSEHandlers): () => void {
+  const url = `${API_BASE}/api/tasks/${taskId}/clarify/stream`
+  const es = new EventSource(url)
+  const types: ClarifySSEEventType[] = ['clarify_stage', 'clarify_ready', 'error']
+  es.onopen = () => handlers.onOpen?.()
+  for (const t of types) {
+    es.addEventListener(t, (ev) => {
+      let parsed: unknown = (ev as MessageEvent).data
+      try {
+        parsed = JSON.parse((ev as MessageEvent).data)
+      } catch {
+        /* keep raw */
+      }
+      handlers.onEvent(t, parsed)
+    })
+  }
+  es.onerror = (e) => {
+    handlers.onError?.(e)
+  }
+  return () => es.close()
+}
+
 export { API_BASE }
+
+/* ── 任务运行态（悬浮条 + 侧栏入口 + 返回语义依赖）────────── */
+export interface TaskStatusResp {
+  status: 'created' | 'clarified' | 'running' | 'done' | 'failed' | null
+  percent: number
+  stage: string
+  evidence_count: number
+  report_id: string | null
+  started_at: string | null
+  updated_at: string | null
+}
+
+export interface RunningTask {
+  task_id: string
+  query: string
+  status: string
+  percent: number
+  stage: string
+  evidence_count: number
+  started_at: string | null
+}
+
+/** 实时进度与状态；断连后仍在后台跑，可轮询感知终态。 */
+export function getTaskStatus(taskId: string): Promise<TaskStatusResp> {
+  return safeJson<TaskStatusResp>(`/api/tasks/${taskId}/status`, undefined, {
+    status: null,
+    percent: 0,
+    stage: '',
+    evidence_count: 0,
+    report_id: null,
+    started_at: null,
+    updated_at: null,
+  })
+}
+
+/** 进行中的任务列表。 */
+export function listRunningTasks(): Promise<RunningTask[]> {
+  return safeJson<RunningTask[]>('/api/tasks/running', undefined, [])
+}
