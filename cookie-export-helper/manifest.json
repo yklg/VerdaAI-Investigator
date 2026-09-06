@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "VerdaAI Cookie 导出助手",
-  "version": "1.1.0",
-  "description": "在已登录的抖音 / 小红书 / B站 页面点一下，清洗后复制全部 Cookie（含 httpOnly）到剪贴板",
+  "name": "VerdaAI Cookie 助手",
+  "version": "2.1.0",
+  "description": "在已登录的抖音 / 小红书 / B站 页面一键复制登录 Cookie，供 VerdaAI 平台采集使用。",
   "permissions": ["cookies", "clipboardWrite", "activeTab"],
   "host_permissions": [
     "*://*.douyin.com/*",
@@ -11,6 +11,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "复制当前站点 Cookie"
+    "default_title": "VerdaAI Cookie 助手"
   }
 }

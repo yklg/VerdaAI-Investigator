@@ -59,6 +59,7 @@ export default function DashboardPage() {
   const [brandFilter, setBrandFilter] = useState<string>('')
   const [typeFilter, setTypeFilter] = useState<string>('')
   const [subQuery, setSubQuery] = useState('')
+  const [subDelError, setSubDelError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -166,8 +167,14 @@ export default function DashboardPage() {
     setSubs(await fetchSubscriptions())
   }
   const handleDeleteSub = async (id: string) => {
-    await deleteSubscription(id)
-    setSubs(await fetchSubscriptions())
+    setSubDelError(null)
+    try {
+      await deleteSubscription(id)
+      setSubs(await fetchSubscriptions())
+    } catch (e) {
+      // 写操作失败必须显式呈现，避免"假删除成功"（列表移除但后端未删）
+      setSubDelError(e instanceof Error && e.message ? e.message : '删除订阅失败，请稍后重试')
+    }
   }
 
   const empty = !loading && (!stats || stats.reports === 0)
@@ -469,6 +476,12 @@ export default function DashboardPage() {
                     </div>
                   ))}
                 </div>
+                {subDelError && (
+                  <div className="mt-3 flex items-start gap-2 rounded-card border border-warn/40 bg-red-50 px-3 py-2 text-tag text-warn">
+                    <Activity size={14} className="mt-0.5 shrink-0" />
+                    <span>删除失败：{subDelError}</span>
+                  </div>
+                )}
               </VCard>
             </motion.div>
           </div>

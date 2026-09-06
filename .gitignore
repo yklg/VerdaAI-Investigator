@@ -97,6 +97,17 @@ tmp/
 temp/
 .cache/
 
+# ============== 部署相关（本计划新增） ==============
+# 后端根目录运行时 SQLite（本地 dev 实测落在 backend/ 下，非 app/data/）
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+
+# 真实 env（仅 .example 模板入库；deploy/.env 与 frontend/.env 由脚本/构建注入）
+deploy/.env
+frontend/.env
+frontend/.env.*
+
 # ============== 云服务 / 平台特定文件 ==============
 .vercel
 .now

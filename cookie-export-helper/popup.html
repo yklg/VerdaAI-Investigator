@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-page-node-id="2yiWHYRGW8aeOHLsHFBmqB">
-  <head data-page-node-id="3qh4Xz9J6I7BGDRMnJeQLf">
-    <meta charset="UTF-8" data-page-node-id="9gBAHMQYaE7cWiXU1stZ9D" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="K8WSvayp3JYhHsgjzn4F4y" />
-    <title>VerdaAI Cookie 导出</title>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VerdaAI Cookie 助手</title>
     <style>
       :root {
         --primary: #7c9885;
@@ -19,7 +19,7 @@
       }
       * { box-sizing: border-box; }
       body {
-        width: 300px;
+        width: 320px;
         margin: 0;
         padding: 16px;
         font-family: 'Inter', 'Noto Sans SC', 'PingFang SC', sans-serif;
@@ -42,7 +42,7 @@
       }
       button:hover { background: var(--primary-deep); }
       button:active { transform: scale(0.98); }
-      /* 兜底按钮：无边框文字按钮，仅在登录态校验未通过时出现 */
+      button:disabled { opacity: 0.5; cursor: default; }
       button.link {
         width: auto;
         height: auto;
@@ -66,6 +66,7 @@
         cursor: pointer;
       }
       .opt input { margin: 0; accent-color: var(--primary); }
+      .divider { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
       #status {
         margin-top: 12px;
         font-size: 12px;
@@ -76,23 +77,23 @@
       }
       #status.ok { display: block; background: rgba(138,181,138,0.15); color: var(--ok); }
       #status.err { display: block; background: rgba(224,183,117,0.15); color: #b9863f; }
-      /* 拦截态：检测到未登录，未写入剪贴板 */
       #status.risk { display: block; background: rgba(198,125,114,0.15); color: var(--risk); }
       #status .meta { display: block; margin-top: 2px; font-size: 11px; opacity: 0.85; }
       .hint { margin-top: 12px; font-size: 11px; color: var(--ink-3); line-height: 1.6; }
     </style>
   </head>
-  <body data-page-node-id="f6H0Wh4YW9kmbGTsqc07Pk">
-    <p class="title" data-page-node-id="DX3wN3FikC10zSEAhX1yhD">Cookie 导出助手</p>
-    <p class="sub" data-page-node-id="1msStvSFh15bZR17eX0fvT">在已登录的抖音 / 小红书 / B站 页面打开本扩展，点下方按钮即复制全部 Cookie（含 httpOnly）；复制前自动清洗非法片段与重复项。</p>
-    <label class="opt" for="onlyKey" data-page-node-id="Oa1KeyFieldChk">
+  <body>
+    <p class="title">VerdaAI Cookie 助手</p>
+    <p class="sub">在已登录的抖音 / 小红书 / B站 页面打开本扩展，一键复制登录 Cookie。</p>
+
+    <label class="opt" for="onlyKey">
       <input type="checkbox" id="onlyKey" />
       仅保留关键字段（串更短，未登录时会拦截）
     </label>
-    <button id="copy" data-page-node-id="OFjw3actmp4KqD3hWqyaNn">复制当前站点 Cookie</button>
-    <div id="status" data-page-node-id="QMkPxGf83bhLFUolDADN0X"></div>
+    <button id="copy">复制当前站点 Cookie</button>
+    <div id="status"></div>
     <button id="force" class="link" hidden>仍要复制（不保证可用）</button>
-    <p class="hint" data-page-node-id="sXV7a84JWzNeT74b8T6lMz">复制后回到 VerdaAI「模型配置 → 编辑配置 → 平台采集」，粘进对应框保存即可。</p>
+    <p class="hint">复制后回到 VerdaAI「模型配置 → 编辑配置 → 平台采集」，粘进对应框保存即可。</p>
     <script src="popup.js"></script>
   </body>
 </html>

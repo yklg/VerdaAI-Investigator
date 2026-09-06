@@ -8,8 +8,9 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
-    "vercel-build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "build": "tsc --noEmit -p tsconfig.app.json && vite build",
+    "vercel-build": "tsc --noEmit -p tsconfig.app.json && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",

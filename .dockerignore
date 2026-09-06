@@ -1,0 +1,22 @@
+# 构建上下文 / 镜像精简：运行时产物与不相关目录不进 docker
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/data.db
+backend/__pycache__/
+backend/.venv/
+backend/tests/
+backend/requirements-dev.txt
+
+# 仓库其它部分（不在 backend/ 内，但仍排除以缩小构建上下文）
+.git/
+.gitignore
+node_modules/
+frontend/
+api/
+docs/
+deploy/
+*.md
+.env
+.env.*
+!.env.example

@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: verda-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # 注意：Render free 实例无持久磁盘，重启即丢 SQLite。需要持久化请用 paid 磁盘
+    #（下方 disk 段），或改用路径②自管云主机。
+    plan: starter
+    numInstances: 1
+    envVars:
+      - key: APP_HOST
+        value: "0.0.0.0"
+      - key: APP_PORT
+        value: "8000"
+      - key: VERDA_DB_PATH
+        value: "/data/verda.db"
+      - key: LLM_API_KEY
+        sync: false        # 在 Render 控制台「Environment」填真实密钥
+      - key: LLM_BASE_URL
+        value: "https://open.bigmodel.cn/api/paas/v4"
+      - key: LLM_MODEL
+        value: "glm-5.1"
+      - key: LLM_MODEL_CORE
+        value: "glm-5.2"
+      - key: LLM_MODEL_AUX
+        value: "glm-5.1"
+      - key: LLM_MODEL_FAST
+        value: "glm-z1-air"
+      - key: BOCHA_API_KEY
+        sync: false
+      - key: BOCHA_BASE_URL
+        value: "https://api.bocha.cn/v1"
+    disk:
+      name: verda-data
+      mountPath: /data
+      sizeGB: 1

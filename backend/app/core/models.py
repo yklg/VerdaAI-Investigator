@@ -18,6 +18,7 @@ class Evidence:
     captured_at: str
     credibility: float  # 0-100 整数（由 credibility.score_evidence 计算，精确到个位、有差异）
     collected_by: str
+    report_id: str = ""  # 证据统一归属具体报告；'' 表示尚未挂载（旧数据兜底，正常路径恒非空）
     screenshot_path: str = ""
     image_urls: List[str] = field(default_factory=list)
     lang: str = "zh"

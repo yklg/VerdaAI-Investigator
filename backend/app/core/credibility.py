@@ -15,6 +15,8 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
+from app.core.platforms import PLATFORMS
+
 
 # 来源类型基础分（与 orchestrator._source_type 的输出一致）
 _BASE_BY_TYPE = {
@@ -30,6 +32,7 @@ _BASE_BY_TYPE = {
     "web": 30,
     "unknown": 30,
 }
+
 
 # 高权威域名/后缀（命中加分）
 _AUTHORITY_HINTS = (
@@ -75,7 +78,7 @@ def freshness_days(captured_at: str) -> Optional[int]:
     for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y/%m/%d", "%Y年%m月%d日"):
         try:
             dt = _dt.datetime.strptime(captured_at[:len(fmt) + 2].strip(), fmt)
-            return max(0, (_dt.datetime.utcnow() - dt).days)
+            return max(0, (_dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - dt).days)
         except Exception:
             continue
     # 退而求其次：只取年月
@@ -84,7 +87,7 @@ def freshness_days(captured_at: str) -> Optional[int]:
         try:
             y, mo = int(m.group(1)), int(m.group(2))
             dt = _dt.datetime(y, max(1, min(12, mo)), 1)
-            return max(0, (_dt.datetime.utcnow() - dt).days)
+            return max(0, (_dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None) - dt).days)
         except Exception:
             return None
     return None

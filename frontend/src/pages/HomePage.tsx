@@ -22,6 +22,7 @@ import { useUIStore } from '../store/uiStore'
 import { useExpertStore } from '../store/expertStore'
 import { createTask } from '../lib/api'
 import { useSettingsStore } from '../store/settingsStore'
+import { useProfileStore } from '../store/profileStore'
 import { findProviderByBaseUrl } from '../lib/llmProviders'
 
 const MODE_OPTIONS = [
@@ -131,6 +132,8 @@ export default function HomePage() {
   const taRef = useRef<HTMLTextAreaElement>(null)
   const experts = useExpertStore((s) => s.experts)
   const wall = experts.slice(0, 14)
+  const profile = useProfileStore()
+  const avatarInitial = (profile.name || '研').trim().slice(0, 1) || '研'
 
   async function submit(q: string) {
     const query = q.trim()
@@ -169,7 +172,7 @@ export default function HomePage() {
           <Sparkles size={14} className="text-primary" /> 新功能上线
         </span>
         <span className="grid h-9 w-9 place-items-center rounded-full bg-primary text-aux font-semibold text-white">
-          研
+          {avatarInitial}
         </span>
       </div>
 
@@ -181,7 +184,7 @@ export default function HomePage() {
           animate="animate"
           className="text-center font-serif text-[44px] leading-tight text-ink"
         >
-          下午好，林研究员
+          下午好，{profile.name}
           <span className="ml-2 inline-block align-middle">
             <Sprout className="inline text-primary" size={34} />
           </span>

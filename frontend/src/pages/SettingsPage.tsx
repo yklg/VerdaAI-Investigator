@@ -128,7 +128,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err' | 'warn'; text: string } | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<(typeof GROUP_ORDER)[number]>('provider')
   // 平台采集「如何获取 Cookie」教程折叠态（默认收起，避免遮挡表单）
@@ -136,6 +136,8 @@ export default function SettingsPage() {
   // 实时模型列表（enrichment layer）：仅对「已保存且命中的厂商」从后端拉取，避免草稿态跨厂商污染
   const [liveModels, setLiveModels] = useState<string[]>([])
   const liveCache = useRef<Record<string, string[]>>({})
+  // 连接测试探测到的「模型不可用 + 建议迁移目标」（后端解析 404 返回），驱动自愈提示条
+  const [suggestedModel, setSuggestedModel] = useState<string | null>(null)
 
   /** resp → form 的唯一转换点（评审 P1-①）：密钥不回显、其余 String(v)。
       load 初次填充与弹窗 onClose「丢弃草稿」共用，防两份逻辑漂移。 */
@@ -241,12 +243,50 @@ export default function SettingsPage() {
     setTesting(true)
     setMsg(null)
     const r = await pingLLM()
-    setMsg(
-      r.ok
-        ? { kind: 'ok', text: `连接正常 · 当前模型 ${r.model ?? '-'}` }
-        : { kind: 'err', text: r.message ?? '连接失败' },
-    )
+    if (r.ok) {
+      setSuggestedModel(null)
+      setMsg({ kind: 'ok', text: `连接正常 · 当前模型 ${r.model ?? '-'}` })
+    } else if (r.reason === 'model_unavailable' && r.suggested_model) {
+      // 后端已解析 404 并给出建议模型 → 点亮自愈提示条
+      setSuggestedModel(r.suggested_model)
+      setMsg({ kind: 'err', text: r.message ?? '当前模型不可用' })
+    } else if (r.reason === 'temporarily_unavailable') {
+      // 评审 P1-a：Google 临时高负载（503）→ 友好中文提示，不显示原始英文栈
+      setSuggestedModel(null)
+      setMsg({ kind: 'warn', text: r.message ?? '当前模型服务负载较高，请稍后重试' })
+    } else {
+      setSuggestedModel(null)
+      setMsg({ kind: 'err', text: r.message ?? '连接失败' })
+    }
     setTesting(false)
+  }
+
+  /** 一键迁移：把模型矩阵中等于「当前不可用模型」的字段替换为建议模型，保存后立即重测。
+      保存走 persist() → saveSettings → 后端 apply_settings → invalidate_client()，
+      确保 LLM 客户端缓存失效（评审 P0：自愈必须清客户端缓存）。 */
+  const migrateToSuggested = async () => {
+    if (!resp || !suggestedModel) return
+    const oldModel = (resp.values.llm_model ?? form.llm_model ?? '').toString()
+    const modelFields = ['llm_model', 'llm_model_core', 'llm_model_aux', 'llm_model_fast']
+    const target: Record<string, string> = { ...form }
+    let changed = false
+    for (const k of modelFields) {
+      if (target[k] === oldModel) {
+        target[k] = suggestedModel
+        changed = true
+      }
+    }
+    // 兜底：若默认模型本就不是 oldModel（例如 core/aux/fast 才是），至少把默认模型更新为建议模型
+    if (!changed) target.llm_model = suggestedModel
+    setForm(target)
+    setMsg(null)
+    const ok2 = await persist(target)
+    if (ok2) {
+      setSuggestedModel(null)
+      void onTest() // 保存后（已失效客户端）自动重测，验证迁移成功
+    } else {
+      resetFormFromResp(resp)
+    }
   }
 
   const groups = useMemo(() => {
@@ -420,8 +460,35 @@ export default function SettingsPage() {
         </p>
       </header>
 
-      {/* 置顶提示条：模型与端点错配（从 model_matrix 卡内上移至页面顶部，全宽可见） */}
-      {modelMismatch && activePreset && (
+      {/* 置顶提示条：模型被厂商下架/不再可用，后端解析 404 给出建议模型 → 自愈迁移入口（优先级高于 modelMismatch） */}
+      {suggestedModel && (
+        <div className="mt-5 flex flex-wrap items-center gap-3 rounded-card border border-warn/40 bg-warn/10 px-4 py-3">
+          <TriangleAlert size={16} className="shrink-0 text-warn" />
+          <span className="min-w-0 flex-1 text-tag leading-relaxed text-ink-2">
+            当前默认模型{' '}
+            <code className="rounded bg-card px-1.5 py-0.5 font-mono text-warn">
+              {resp?.values.llm_model || form.llm_model || '（空）'}
+            </code>{' '}
+            已被 {savedPreset?.name ?? '该厂商'} 下架或不再对新用户开放。
+          </span>
+          <button
+            type="button"
+            onClick={() => void migrateToSuggested()}
+            disabled={saving}
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-chip bg-primary px-3 text-tag font-medium text-white transition-all hover:bg-primary-deep active:scale-95 disabled:opacity-50"
+          >
+            {saving ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <RefreshCw size={13} strokeWidth={2.2} />
+            )}
+            一键迁移到 {suggestedModel}
+          </button>
+        </div>
+      )}
+
+      {/* 置顶提示条：模型与端点错配（从 model_matrix 卡内上移至页面顶部，全宽可见）；自愈态时让位 */}
+      {modelMismatch && activePreset && !suggestedModel && (
         <div className="mt-5 flex flex-wrap items-center gap-3 rounded-card border border-warn/40 bg-warn/10 px-4 py-3">
           <TriangleAlert size={16} className="shrink-0 text-warn" />
           <span className="min-w-0 flex-1 text-tag leading-relaxed text-ink-2">
@@ -736,7 +803,11 @@ export default function SettingsPage() {
             {msg && (
               <div
                 className={`border-t border-line/50 px-6 py-2.5 text-tag ${
-                  msg.kind === 'ok' ? 'text-ok' : 'text-risk'
+                  msg.kind === 'ok'
+                    ? 'text-ok'
+                    : msg.kind === 'warn'
+                      ? 'text-warn'
+                      : 'text-risk'
                 }`}
               >
                 {msg.text}

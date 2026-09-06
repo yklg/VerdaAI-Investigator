@@ -19,6 +19,7 @@ from collections import deque
 from typing import Any, Dict, List, Optional
 
 from app.core import db, orchestrator
+from app.core.llm import LLMModelUnavailable, is_temporary_unavailable
 
 BUFFER_MAX = 2000          # 历史缓冲容量，超出自动淘汰最旧事件
 RELEASE_DELAY = 300.0      # 终态后保留窗口（秒），供末次重连补帧，超时释放防内存泄漏
@@ -89,7 +90,12 @@ def ensure_running(task_id: str) -> _Run:
 
 async def _drive(task_id: str, r: _Run) -> None:
     try:
-        async for ev in orchestrator.run_pipeline(task_id):
+        # 按 tasks.kind 分发到不同的执行引擎（共享 progress/done/error 处理）
+        full = db.get_task_full(task_id) or {}
+        kind = (full.get("kind") or "research")
+        gen = (orchestrator.refine_report_pipeline(task_id)
+               if kind == "refine" else orchestrator.run_pipeline(task_id))
+        async for ev in gen:
             r.buffer.append(ev)          # 历史缓冲（重连补帧）
             for q in list(r.subs):       # 广播给各订阅者专属队列
                 q.put_nowait(ev)
@@ -112,11 +118,25 @@ async def _drive(task_id: str, r: _Run) -> None:
         r.error = "用户取消"
         db.set_task_failed(task_id, "用户取消")
         raise
+    except LLMModelUnavailable as e:
+        # 模型被厂商下架/重命名：给出含建议模型的友好提示，引导去「模型配置」页迁移
+        r.status = "failed"
+        msg = (
+            f"当前模型不可用（{e.suggested_model or '厂商已下架'}）：{e}。"
+            f"请到「模型配置」页一键迁移到 {e.suggested_model or '可用模型'}。"
+        )
+        r.error = msg
+        db.set_task_failed(task_id, msg)
     except Exception as e:  # noqa: BLE001
         # 终态收尾，绝不静默吞掉；标记失败以便前端与 DB 状态一致
+        if is_temporary_unavailable(e):
+            # 评审 P1-b：Google 临时高负载（503），给友好文案而非原始英文栈
+            msg = "当前模型服务负载较高（503），请稍后 30 秒左右重试再发起调研。"
+        else:
+            msg = str(e)
         r.status = "failed"
-        r.error = str(e)
-        db.set_task_failed(task_id, str(e))
+        r.error = msg
+        db.set_task_failed(task_id, msg)
     finally:
         r.alive = False
         for q in list(r.subs):

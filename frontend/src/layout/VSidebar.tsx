@@ -13,6 +13,9 @@ import {
 } from 'lucide-react'
 import { fetchDashboard } from '../lib/api'
 import { useTaskRegistry, selectRunning } from '../store/taskRegistry'
+import { useProfileStore } from '../store/profileStore'
+import { VModal, VButton } from '../components/ui'
+import { useShallow } from 'zustand/react/shallow'
 
 const navItems = [
   { to: '/', label: '工作台', icon: Home, end: true },
@@ -26,7 +29,33 @@ export default function VSidebar() {
   const navigate = useNavigate()
   const [reports, setReports] = useState(0)
   const [evidence, setEvidence] = useState(0)
-  const running = useTaskRegistry(selectRunning)
+  // selectRunning 每次调用返回新数组 → 用 useShallow 做浅比较，避免 Zustand v5 +
+  // React 19 useSyncExternalStore 把「同值新引用」当成快照变更，引发无限重渲染（白屏）。
+  const running = useTaskRegistry(useShallow(selectRunning))
+
+  // 当前用户资料（单一数据源：store + localStorage）
+  const profile = useProfileStore()
+  const [editing, setEditing] = useState(false)
+  const [draftName, setDraftName] = useState('')
+  const [draftCompany, setDraftCompany] = useState('')
+
+  // 头像缩写由昵称派生（改名后同步），回退「研」
+  const avatarInitial = (profile.name || '研').trim().slice(0, 1) || '研'
+
+  const openEdit = () => {
+    setDraftName(profile.name)
+    setDraftCompany(profile.company)
+    setEditing(true)
+  }
+  const saveProfile = () => {
+    const name = draftName.trim()
+    const company = draftCompany.trim()
+    profile.setProfile({
+      name: name || profile.name,
+      company: company || profile.company,
+    })
+    setEditing(false)
+  }
 
   useEffect(() => {
     fetchDashboard().then((d) => {
@@ -119,27 +148,78 @@ export default function VSidebar() {
           <Sprout size={16} className="text-primary" strokeWidth={2} />
           <span className="text-aux font-semibold text-ink">我的工作空间</span>
         </div>
-        <p className="mt-1 text-tag text-ink-3">累计完成 {reports} 次调研</p>
-        <div className="mt-2 h-1.5 w-full overflow-hidden rounded-chip bg-line">
-          <div
-            className="h-full rounded-chip bg-primary transition-all"
-            style={{ width: `${Math.min(100, reports * 10)}%` }}
-          />
-        </div>
-        <p className="mt-1.5 text-right text-tag text-ink-3">已沉淀 {evidence} 条证据</p>
+        <p className="mt-1 text-tag text-ink-3">
+          累计完成 {reports} 次调研 · 已沉淀 {evidence} 条证据
+        </p>
       </div>
 
-      {/* 底部用户 */}
-      <div className="flex items-center gap-3 border-t border-line px-4 py-3.5">
+      {/* 底部用户：点击弹出编辑弹窗（C1） */}
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={openEdit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            openEdit()
+          }
+        }}
+        title="点击修改昵称与公司"
+        className="flex cursor-pointer items-center gap-3 border-t border-line px-4 py-3.5 transition-colors duration-200 ease-verda hover:bg-primary-tint/40"
+      >
         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-sun text-[13px] font-semibold text-ink">
-          研
+          {avatarInitial}
         </span>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-aux font-medium text-ink">林研究员</div>
-          <div className="truncate text-tag text-ink-3">青野科技</div>
+          <div className="truncate text-aux font-medium text-ink">{profile.name}</div>
+          <div className="truncate text-tag text-ink-3">{profile.company}</div>
         </div>
         <ChevronDown size={16} className="text-ink-3" />
       </div>
+
+      <VModal
+        open={editing}
+        onClose={() => setEditing(false)}
+        title="编辑个人资料"
+        height="min(360px,80vh)"
+      >
+        <div className="flex h-full flex-col px-6 py-4">
+          <div className="flex-1">
+            <label className="mb-1.5 block text-tag font-medium text-ink-2">昵称</label>
+            <input
+              value={draftName}
+              onChange={(e) => setDraftName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  saveProfile()
+                }
+              }}
+              className="mb-4 w-full rounded-btn border border-line bg-card px-3 py-2 text-[14px] text-ink outline-none transition-colors duration-150 ease-verda focus:border-primary focus:ring-2 focus:ring-primary/20"
+              placeholder="如：李工 / 王研究员"
+            />
+            <label className="mb-1.5 block text-tag font-medium text-ink-2">公司</label>
+            <input
+              value={draftCompany}
+              onChange={(e) => setDraftCompany(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  saveProfile()
+                }
+              }}
+              className="w-full rounded-btn border border-line bg-card px-3 py-2 text-[14px] text-ink outline-none transition-colors duration-150 ease-verda focus:border-primary focus:ring-2 focus:ring-primary/20"
+              placeholder="如：青野科技"
+            />
+          </div>
+          <div className="flex justify-end gap-2 pt-4">
+            <VButton variant="ghost" onClick={() => setEditing(false)}>
+              取消
+            </VButton>
+            <VButton onClick={saveProfile}>保存</VButton>
+          </div>
+        </div>
+      </VModal>
     </aside>
   )
 }

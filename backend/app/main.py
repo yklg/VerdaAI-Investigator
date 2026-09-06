@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -18,8 +19,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core import db
-from app.core.llm import LLMNotConfigured, chat
-from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section, generate_clarify
+from app.core.llm import LLMModelUnavailable, LLMNotConfigured, chat
+import logging
+from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section, generate_clarify, create_refine_task
 from app.core import runner
 from app.core.runtime_config import (
     GROUP_FIELDS,
@@ -34,6 +36,8 @@ from app.core.runtime_config import (
 )
 from app.core.search import search
 from app.data import expert_by_id, load_experts
+
+_logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -97,8 +101,32 @@ def llm_ping():
         }
     except LLMNotConfigured as e:
         return {"ok": False, "reason": "not_configured", "message": str(e)}
+    except LLMModelUnavailable as e:
+        return {
+            "ok": False,
+            "reason": "model_unavailable",
+            "message": str(e),
+            "suggested_model": e.suggested_model,
+        }
     except Exception as e:  # noqa: BLE001
+        from app.core.llm import is_temporary_unavailable
+
+        if is_temporary_unavailable(e):
+            return {
+                "ok": False,
+                "reason": "temporarily_unavailable",
+                "message": "当前模型服务负载较高（503），请稍后 30 秒左右重试。",
+            }
         return {"ok": False, "reason": "error", "message": str(e)}
+
+
+def _normalize_model_id(mid: str) -> str:
+    """评审 P0：剥离 Google OpenAI-兼容网关返回的命名空间前缀 `models/`。
+
+    使用捕获组提取（^models/(.+)$），绝不全局替换，避免误伤模型名本体——
+    例如 tuned 模型 `publishers/google/models/xxx` 不以 `models/` 开头，应原样保留。
+    """
+    return re.sub(r"^models/(.+)$", r"\1", mid)
 
 
 @app.get("/api/llm/models")
@@ -122,9 +150,18 @@ def list_provider_models():
         r.raise_for_status()
         payload = r.json()
         data = payload.get("data", []) if isinstance(payload, dict) else []
-        ids = [m["id"] for m in data if isinstance(m, dict) and m.get("id")]
+        # 评审 P0：剥离 Google OpenAI-兼容网关返回的命名空间前缀 `models/`，
+        # 用捕获组提取，绝不全局替换（避免误伤本体含 models/ 的模型名，如 publishers/.../models/...）。
+        ids = [_normalize_model_id(m["id"]) for m in data if isinstance(m, dict) and m.get("id")]
         return {"ok": True, "models": ids}
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # 评审 P2：记录原始响应片段，便于排查 Gemini 等厂商的 /models 非标格式
+        _logger.warning(
+            "enrichment /models 拉取失败 base=%s status=%s body=%s",
+            base,
+            getattr(e, "status_code", None),
+            (r.text[:300] if "r" in dir() and hasattr(r, "text") else ""),
+        )
         return {"ok": False, "reason": "fetch_failed"}
 
 
@@ -290,9 +327,9 @@ def task_cancel(task_id: str):
 @app.get("/api/tasks/{task_id}/clarify/stream")
 async def stream_clarify(task_id: str, request: Request):
     async def gen():
-        # 重连/刷新：DB 已有则直接推送，避免重复 LLM 调用（P1 重连直读）
-        existing = db.get_clarify_questions(task_id)
-        if existing:
+        # 重连/刷新：DB 已有完整问卷则直接推送，避免重复 LLM 调用（P1 重连直读）
+        existing, complete = db.get_clarify_questions(task_id)
+        if existing and complete:
             yield f"event: clarify_ready\ndata: {json.dumps(existing, ensure_ascii=False)}\n\n"
             return
         task = db.get_task(task_id)
@@ -332,6 +369,13 @@ def get_report(report_id: str):
     return rep
 
 
+@app.delete("/api/reports/{report_id}")
+def delete_report(report_id: str):
+    """删除调研报告（级联清理证据/链路/反馈/任务）。"""
+    db.delete_report(report_id)
+    return {"ok": True}
+
+
 # ── 可观测性 Trace（决策链路 / 决策回放）──────────────────
 @app.get("/api/tasks/{task_id}/trace")
 def get_task_trace(task_id: str):
@@ -365,7 +409,29 @@ def post_feedback(report_id: str, body: FeedbackBody):
         from app.core.metrics import apply_feedback
         rep["metrics"] = apply_feedback(rep["metrics"], body.edited_blocks, body.total_blocks)
         db.save_report(rep, task_id="")
+    # 派生数据失效钩子：metrics 已变化，简报/一页纸精炼作废（失效即淘汰，防陈旧结论）
+    db.invalidate_report_brief(report_id)
     return {"ok": True}
+
+
+# ── 简报一页纸精炼（派生数据，懒生成落库）──────────────────
+@app.post("/api/reports/{report_id}/brief")
+def post_brief(report_id: str):
+    """生成（或复用）报告的"一页纸精炼"简报。
+
+    幂等：库中已有 brief 直接返回；LLM 未配置 → 503；报告不存在 → 404。
+    同步端点（线程池执行）：单次 LLM 调用 5-20s，前端 loading + 30s 失败冷却兜底。
+    """
+    if not db.get_report(report_id):
+        raise HTTPException(status_code=404, detail="报告不存在或未就绪")
+    from app.core.orchestrator import generate_brief  # 内联：与端点同批落地，避免 import 行被并发覆盖丢失
+    try:
+        brief = generate_brief(report_id)
+    except LLMNotConfigured as e:
+        raise HTTPException(status_code=503, detail=f"LLM 未配置：{e}") from e
+    if not brief:
+        return {"ok": False, "brief": None, "message": "生成失败，请稍后重试"}
+    return {"ok": True, "brief": brief}
 
 
 # ── 按批注深化章节（人工介入二次调研）────────────────────
@@ -376,7 +442,32 @@ class RefineBody(BaseModel):
 
 @app.post("/api/reports/{report_id}/refine")
 def post_refine(report_id: str, body: RefineBody):
-    return refine_section(report_id, body.section_id, body.annotations)
+    res = refine_section(report_id, body.section_id, body.annotations)
+    # 派生数据失效钩子：章节正文已改写，简报/一页纸精炼作废
+    db.invalidate_report_brief(report_id)
+    return res
+
+
+# ── 基于新证据异步精修报告（kind=refine 后台任务）──────────
+class RefineEvidenceBody(BaseModel):
+    evidence_ids: List[str] = []
+    min_cred: float = 70.0
+
+
+@app.post("/api/reports/{report_id}/refine-evidence")
+def refine_evidence(report_id: str, body: RefineEvidenceBody):
+    """基于新补充的高可信度证据精修报告正文。
+
+    仅创建一个 kind='refine' 的后台任务并返回 {taskId}（同步快路径，无阻塞 LLM 调用）。
+    前端拿 taskId 订阅既有 GET /api/tasks/{taskId}/stream 获取进度/取消/重连。
+    """
+    if not db.get_report(report_id):
+        raise HTTPException(status_code=404, detail="报告不存在")
+    return create_refine_task(
+        report_id,
+        body.evidence_ids or None,
+        body.min_cred,
+    )
 
 
 # ── 仪表盘（真实统计）───────────────────────────────────
@@ -392,8 +483,13 @@ def evidences(
     source_type: Optional[str] = None,
     min_cred: float = 0.0,
     limit: int = 200,
+    report_id: Optional[str] = None,
 ):
-    items = db.query_evidences(brand=brand, source_type=source_type, min_cred=min_cred, limit=limit)
+    # report_id 过滤：不传 → 全部证据；'<rid>' → 仅该报告证据。
+    items = db.query_evidences(
+        brand=brand, source_type=source_type, min_cred=min_cred,
+        limit=limit, report_id=report_id,
+    )
     return {"items": items, "facets": db.evidence_facets()}
 
 

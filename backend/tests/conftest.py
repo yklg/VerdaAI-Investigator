@@ -25,6 +25,7 @@ import app.core.runtime_config as rc  # noqa: E402
 def _isolate():
     """每用例前清空 settings 表并重置进程级迁移标记/缓存。"""
     db.clear_settings()
+    db.clear_discovery_cache()
     rc._MODEL_MIGRATED = False
     rc._MIGRATED = False
     rc.invalidate_cache()

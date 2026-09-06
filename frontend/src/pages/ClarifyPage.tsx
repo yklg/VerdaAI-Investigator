@@ -20,12 +20,17 @@ export default function ClarifyPage() {
 
   // SSE 驱动的问卷状态（不再读 state.clarify，改为懒生成）
   const [questions, setQuestions] = useState<ClarifyQuestion[]>([])
-  const [ready, setReady] = useState(false) // 是否已收到 clarify_ready / error
+  const [ready, setReady] = useState(false) // 是否已收到首屏（partial 或完整）
   const [stage, setStage] = useState('正在准备问卷…') // loading 阶段文案
   const [error, setError] = useState<string | null>(null)
-  const [degraded, setDegraded] = useState(false) // LLM 失败降级
   const [runId, setRunId] = useState(0) // 重试时自增，重新拉起 SSE
   const [step, setStep] = useState(0) // 向导步：0..N-1 单题；===N 为核对屏
+  // 流式加载反馈（C1/C2）：基础题已就绪但竞品发现仍在后台时展示进度条 + 标识
+  const [discoveryOngoing, setDiscoveryOngoing] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [progressLabel, setProgressLabel] = useState('正在准备问卷…')
+  // 竞品识别兜底（C6）：超时/异常时竞品为自动识别候选，需温和提示而非大警告
+  const [competitorsFallback, setCompetitorsFallback] = useState(false)
 
   // 自动前进延时：单选为快速视觉锁定（一击即定）；多选需留时间勾多项，故更长且每次勾选都重置
   const SINGLE_ADVANCE_MS = 350
@@ -41,6 +46,8 @@ export default function ClarifyPage() {
   // 自动前进定时器句柄：单选选中后延时跳下一题，用 ref 持有以便 clearTimeout，
   // 避免「选中后又点下一步」造成双跳，以及 step 变化 / 卸载时的泄漏。
   const advanceTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 是否已进入核对屏：clarify_update 到达时据此决定是否保持核对屏（C5）
+  const reviewReachedRef = useRef(false)
   useEffect(() => {
     titleRef.current?.focus()
     return () => {
@@ -50,6 +57,11 @@ export default function ClarifyPage() {
       }
     }
   }, [step, ready])
+
+  // 跟踪是否已进入核对屏（供 clarify_update 到达时保持核对屏，C5）
+  useEffect(() => {
+    reviewReachedRef.current = ready && questions.length > 0 && step === questions.length
+  }, [ready, questions, step])
 
   // 挂载后通过 SSE 懒生成问卷；loading 阶段绝不跳转（修 P0#3：原 questions.length===0 误跳）
   useEffect(() => {
@@ -67,19 +79,61 @@ export default function ClarifyPage() {
     // （即本调用返回、closeFn 已赋值）才异步到达；若测试同步派发事件，closeFn 尚
     // 未赋值，?.() 安全 no-op，避免 TDZ（Cannot access 'close' before initialization）。
     let closeFn: (() => void) | undefined
+    let partialDone = false // 已收到 partial 基础题但尚未 complete（用于 onError 守卫）
     const close = openClarifyStream(taskId, {
       onEvent: (type, data) => {
         if (closed) return
         if (type === 'clarify_stage') {
-          const d = data as { message?: string }
-          if (d?.message) setStage(d.message)
+          const d = data as { stage?: string; message?: string }
+          if (d?.stage === 'understanding') {
+            setProgress(20)
+            setProgressLabel(d?.message || '正在理解你的需求…')
+            if (d?.message) setStage(d.message)
+          } else if (d?.stage === 'discovering') {
+            setProgress(70)
+            setProgressLabel('正在发现竞品…')
+          } else if (d?.message) {
+            setStage(d.message)
+          }
         } else if (type === 'clarify_ready') {
-          const d = data as { questions?: ClarifyQuestion[]; degraded?: boolean }
-          setQuestions(d?.questions ?? [])
-          setDegraded(Boolean(d?.degraded))
+          const d = data as {
+            questions?: ClarifyQuestion[]
+            partial?: boolean
+            competitors_fallback?: boolean
+          }
+          if (d?.partial) {
+            // 仅基础题：立即可答，竞品发现仍在后台（C3）——不关闭流、不置 done
+            setQuestions(d?.questions ?? [])
+            setReady(true)
+            partialDone = true
+            setDiscoveryOngoing(true)
+            setProgress(50)
+            setProgressLabel('基础问卷已就绪，正在发现竞品…')
+          } else {
+            // 完整问卷（重连 / 在途复用）：原行为，收齐即关闭流
+            setQuestions(d?.questions ?? [])
+            setReady(true)
+            if (d?.competitors_fallback) setCompetitorsFallback(true)
+            done = true
+            closeFn?.() // 问卷已完整送达，主动关闭有限流，避免流关闭触发 onerror 误报
+          }
+        } else if (type === 'clarify_update') {
+          // 竞品发现完成：增量替换整组题目（答案按 id 保留），保持当前步（C4/C5）
+          const d = data as {
+            questions?: ClarifyQuestion[]
+            competitors_fallback?: boolean
+            complete?: boolean
+          }
+          const newQs = d?.questions ?? []
+          const wasAtReview = reviewReachedRef.current
+          setQuestions(newQs)
+          if (d?.competitors_fallback) setCompetitorsFallback(true)
+          if (wasAtReview) setStep(newQs.length) // 已在核对屏 → 保持核对屏并补入新题
           setReady(true)
+          setDiscoveryOngoing(false)
+          setProgress(100)
           done = true
-          closeFn?.() // S1：问卷已完整送达，主动关闭有限流，避免流关闭触发 onerror 误报
+          closeFn?.()
         } else if (type === 'error') {
           const d = data as { message?: string }
           setError(d?.message ?? '问卷生成失败')
@@ -89,7 +143,9 @@ export default function ClarifyPage() {
       },
       onError: () => {
         if (closed) return
-        if (done) return // S2：终态已抵达后，有限流关闭触发的 onerror 属正常重连行为，忽略（绝不误报）
+        // 终态已抵达（完整或 partial）后，有限流关闭触发的 onerror 属正常重连，忽略（S2）；
+        // partial 后流中断（发现未完成）也不误报，基础题仍可作答（C3 兜底）。
+        if (done || partialDone) return
         setError('连接中断，请重试')
         setReady(true)
       },
@@ -145,26 +201,29 @@ export default function ClarifyPage() {
   }
 
   // 添加自定义选项（如用户自己想调研的竞品），加入已选集合并成为可见 chip。
-  // schedule=false 时（核对屏）不排程自动前进，仅单步向导触发。
-  function addCustom(qid: string, schedule = true) {
+  // 返回合并后的数组（无输入返回 null）。是否自动前进由调用方经 maybeAdvance 决策，
+  // 故此处不再持有 schedule 形参——「核对屏不自动前进」规则统一收敛到上层 wiring（review 不调 maybeAdvance）。
+  function addCustom(qid: string): string[] | null {
     const raw = (customInputs[qid] ?? '').trim()
-    if (!raw) return
+    if (!raw) return null
     // 支持一次输入多个，用逗号/顿号/空格分隔
     const items = raw.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean)
+    const cur = (answers[qid] as string[]) ?? []
+    const merged = [...cur]
+    for (const it of items) if (!merged.includes(it)) merged.push(it)
     setAnswers((a) => {
-      const cur = (a[qid] as string[]) ?? []
-      const merged = [...cur]
-      for (const it of items) if (!merged.includes(it)) merged.push(it)
-      return { ...a, [qid]: merged }
+      const c = (a[qid] as string[]) ?? []
+      const m = [...c]
+      for (const it of items) if (!m.includes(it)) m.push(it)
+      return { ...a, [qid]: m }
     })
     setCustomInputs((c) => ({ ...c, [qid]: '' }))
-    // competitors 是 multi：用闭包 answers 估算是否已 ≥1 项，决定是否纳入停顿计时
-    const curLen = ((answers[qid] as string[]) ?? []).length
-    if (schedule && curLen + items.length > 0) scheduleAdvance(MULTI_ADVANCE_MS)
+    return merged
   }
 
   async function go() {
     if (submitting || !taskId) return
+    cancelAdvance() // 防止单步「跳过」时挂起的自动前进计时器在异步提交期间插队跳步
     setSubmitting(true)
     try {
       await submitClarify(taskId, answers)
@@ -215,6 +274,7 @@ export default function ClarifyPage() {
   if (!isReview && questions.length === 0) return null
   const q = !isReview ? questions[step] : null
   const pct = questions.length ? Math.round(((step + 1) / questions.length) * 100) : 0
+  const competitorsPresent = questions.some((item) => item.id === 'competitors')
 
   // 派生：当前题是否为单选/多选（自动前进适用），及已选数量。
   // selectedCount>0 与「自动前进计时器挂起」等价（选中即排程、归零即撤销、前进即切步），
@@ -232,6 +292,18 @@ export default function ClarifyPage() {
   return (
     <div className="relative min-h-screen overflow-y-auto bg-bg">
       <VSunGlow className="opacity-40" />
+      {discoveryOngoing && (
+        <div className="sticky top-0 z-20">
+          <div className="h-1 w-full bg-line/60">
+            <div className="h-full bg-primary transition-[width] duration-500" style={{ width: `${progress}%` }} />
+          </div>
+          <div className="flex items-center justify-center gap-2 bg-bg/90 py-1.5 text-tag text-ink-3 backdrop-blur">
+            <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+            {progressLabel}
+            <span className="rounded-full border border-primary/40 px-2 py-0.5 text-primary-deep">竞品识别中…</span>
+          </div>
+        </div>
+      )}
       <div className="relative z-10 mx-auto flex min-h-screen max-w-[680px] flex-col justify-center px-6 py-16">
         {!isReview && q && (
           <>
@@ -245,9 +317,11 @@ export default function ClarifyPage() {
               </div>
             </motion.div>
 
-            {degraded && (
-              <div className="mt-4 rounded-card border border-amber-200 bg-amber-50 px-4 py-2.5 text-tag text-amber-700">
-                已使用默认问卷（AI 问卷生成暂不可用），不影响后续调研。
+            {competitorsFallback && q?.id === 'competitors' && (
+              <div className="mt-4 rounded-card border border-line/60 bg-card px-4 py-2.5 text-tag text-ink-3">
+                {competitorsPresent
+                  ? '以下竞品为自动识别候选，建议核对或手动补充。'
+                  : '未能自动识别竞品，可在「补充」题说明你关注的对手。'}
               </div>
             )}
 
@@ -294,7 +368,14 @@ export default function ClarifyPage() {
                 onCustomInputChange={
                   q.id === 'competitors' ? (v) => { setCustomInputs((c) => ({ ...c, [q.id]: v })); cancelAdvance() } : undefined
                 }
-                onCustomAdd={q.id === 'competitors' ? () => addCustom(q.id) : undefined}
+                onCustomAdd={
+                  q.id === 'competitors'
+                    ? () => {
+                        const next = addCustom(q.id)
+                        if (next) maybeAdvance('multi', next)
+                      }
+                    : undefined
+                }
               />
 
               {/* 自动前进锁定提示：选中后短暂窗口内将自动跳，给用户看清 + 可控（点完成本题） */}
@@ -348,9 +429,11 @@ export default function ClarifyPage() {
               </div>
             </motion.div>
 
-            {degraded && (
-              <div className="mt-4 rounded-card border border-amber-200 bg-amber-50 px-4 py-2.5 text-tag text-amber-700">
-                已使用默认问卷（AI 问卷生成暂不可用），不影响后续调研。
+            {competitorsFallback && (
+              <div className="mt-4 rounded-card border border-line/60 bg-card px-4 py-2.5 text-tag text-ink-3">
+                {competitorsPresent
+                  ? '以下竞品为自动识别候选，建议核对或手动补充。'
+                  : '未能自动识别竞品，可在「补充」题说明你关注的对手。'}
               </div>
             )}
 
@@ -376,7 +459,7 @@ export default function ClarifyPage() {
                     onCustomInputChange={
                       item.id === 'competitors' ? (v) => setCustomInputs((c) => ({ ...c, [item.id]: v })) : undefined
                     }
-                    onCustomAdd={item.id === 'competitors' ? () => addCustom(item.id, false) : undefined}
+                    onCustomAdd={item.id === 'competitors' ? () => addCustom(item.id) : undefined}
                   />
                 </div>
               ))}

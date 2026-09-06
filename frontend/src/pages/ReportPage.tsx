@@ -13,9 +13,7 @@ import {
   Sparkles,
   Link2,
   FileText,
-  Database,
-  ShieldCheck,
-  Layers,
+  Presentation,
   Image as ImageIcon,
   ExternalLink,
   Pencil,
@@ -37,10 +35,13 @@ import { VMetricsPanel } from '../components/VMetricsPanel'
 import { VQualityGate } from '../components/VQualityGate'
 import { VAuditReview } from '../components/VAuditReview'
 import { VDecisionReplay } from '../components/VDecisionReplay'
+import { coverFor } from '../lib/cover'
 import { VDataGrid } from '../components/VDataGrid'
 import { VFeatureMatrix, VPricingTable, VPersonaCards } from '../components/VStructured'
-import { refineSection, submitFeedback } from '../lib/api'
-import { VSkeleton, VCountUp } from '../components/ui'
+import { refineSection, submitFeedback, refineReportEvidence, openTaskStream } from '../lib/api'
+import { VSkeleton } from '../components/ui'
+import MetricsStrip from '../components/MetricsStrip'
+import ReportBriefView from '../components/ReportBriefView'
 
 const HL_DOT: Record<HighlightColor, string> = {
   sun: 'bg-sun',
@@ -62,8 +63,11 @@ export default function ReportPage() {
   const [activeSection, setActiveSection] = useState<string>('')
   const [readProgress, setReadProgress] = useState(0)
   const [editMode, setEditMode] = useState(false)
+  const [briefMode, setBriefMode] = useState(false)
   const [highlightedEv, setHighlightedEv] = useState<string[]>([])
   const [refiningSec, setRefiningSec] = useState<string>('')
+  const [refiningAll, setRefiningAll] = useState(false)
+  const [refineProgress, setRefineProgress] = useState<{ percent: number; stage: string } | null>(null)
   const mainRef = useRef<HTMLElement>(null)
   const articleRef = useRef<HTMLDivElement>(null)
   const rid = reportId ?? ''
@@ -136,6 +140,43 @@ export default function ReportPage() {
     } else {
       flash(res.message || '深化失败，请重试')
     }
+  }
+
+  // 基于新归属的高可信度证据异步精修整篇报告（P1-3：显式 SSE 接线 + 本地进度 + done→重载）
+  async function handleRefineEvidence() {
+    if (!current || refiningAll) return
+    setRefiningAll(true)
+    setRefineProgress({ percent: 0, stage: '准备中…' })
+    const res = await refineReportEvidence(rid, { min_cred: 70 })
+    if (!res.taskId) {
+      setRefiningAll(false)
+      setRefineProgress(null)
+      flash('发起精修失败，请重试')
+      return
+    }
+    const close = openTaskStream(res.taskId, {
+      onEvent: (type, data: any) => {
+        if (type === 'progress') {
+          setRefineProgress({ percent: data?.percent ?? 0, stage: data?.stage ?? '' })
+        } else if (type === 'done') {
+          setRefiningAll(false)
+          setRefineProgress(null)
+          load(rid)
+          flash('报告已基于新证据精修完成')
+          close()
+        } else if (type === 'error') {
+          setRefiningAll(false)
+          setRefineProgress(null)
+          flash((data?.message as string) || '精修失败，请重试')
+          close()
+        }
+      },
+      onError: () => {
+        // 连接断开不代表任务失败（runner 后台继续跑），仅收起进度 UI，不报错。
+        setRefiningAll(false)
+        setRefineProgress(null)
+      },
+    })
   }
 
   // ── 标注 / 知识库处理 ──
@@ -223,16 +264,6 @@ export default function ReportPage() {
   const r = current
   // 证据 id → 序号（用于章节级溯源 chips）
   const evIndex = new Map(r.evidence.map((e, i) => [e.evidence_id, i + 1]))
-  // 关键指标速览（封面下方数据带，全部来自真实数据）
-  const indepDomains = new Set(r.evidence.map((e) => e.domain).filter(Boolean)).size
-  const highConf = r.claims.filter((c) => c.confidence === 'high').length
-  const confRate = r.claims.length ? Math.round((highConf / r.claims.length) * 100) : 0
-  const metrics = [
-    { icon: FileText, label: '核心结论', value: r.claims.length, unit: '条' },
-    { icon: Database, label: '联网证据', value: r.evidence.length, unit: '条' },
-    { icon: Layers, label: '独立信源', value: indepDomains, unit: '个' },
-    { icon: ShieldCheck, label: '高置信占比', value: confRate, unit: '%' },
-  ]
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg">
@@ -296,7 +327,7 @@ export default function ReportPage() {
         {/* 杂志封面 */}
         <div className="relative overflow-hidden">
           <img
-            src={r.cover_image ?? '/assets/brand/report-cover.png'}
+            src={coverFor(r)}
             alt="cover"
             className="h-60 w-full object-cover"
             onError={(e) => ((e.target as HTMLImageElement).style.display = 'none')}
@@ -333,6 +364,20 @@ export default function ReportPage() {
               </button>
             )}
             <button
+              onClick={() => setBriefMode((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded-btn px-3 h-9 text-aux font-medium backdrop-blur ${
+                briefMode ? 'bg-primary text-white' : 'bg-card/90 text-ink-2 hover:text-primary-deep'
+              }`}
+            >
+              <FileText size={15} /> 简报
+            </button>
+            <button
+              onClick={() => navigate(`/report/${r.id}/slides`)}
+              className="inline-flex items-center gap-1.5 rounded-btn bg-card/90 px-3 h-9 text-aux font-medium text-ink-2 backdrop-blur hover:text-primary-deep"
+            >
+              <Presentation size={15} /> 演示
+            </button>
+            <button
               onClick={toggleEditMode}
               className={`inline-flex items-center gap-1.5 rounded-btn px-3 h-9 text-aux font-medium backdrop-blur ${
                 editMode ? 'bg-primary text-white' : 'bg-card/90 text-ink-2 hover:text-primary-deep'
@@ -349,23 +394,15 @@ export default function ReportPage() {
           </div>
         </div>
 
-        {/* 关键指标速览数据带 */}
+        {/* 关键指标速览数据带（指标定义单一来源，见 components/MetricsStrip.tsx） */}
         <div className="border-b border-line bg-card/60">
-          <div className="mx-auto grid max-w-3xl grid-cols-2 gap-px px-6 sm:grid-cols-4">
-            {metrics.map((m, i) => (
-              <div key={i} className="flex flex-col items-center gap-1 py-5">
-                <m.icon size={16} className="text-primary" />
-                <div className="flex items-baseline gap-0.5">
-                  <VCountUp value={m.value} className="font-serif text-[26px] leading-none text-ink" />
-                  <span className="text-tag text-ink-3">{m.unit}</span>
-                </div>
-                <span className="text-tag text-ink-3">{m.label}</span>
-              </div>
-            ))}
-          </div>
+          <MetricsStrip report={r} />
         </div>
 
-        {/* 正文章节 */}
+        {/* 正文章节（简报模式替换为简报视图） */}
+        {briefMode ? (
+          <ReportBriefView report={r} />
+        ) : (
         <article ref={articleRef} className="relative mx-auto max-w-3xl px-6 py-10">
           <VSelectionToolbar
             containerRef={articleRef}
@@ -584,6 +621,7 @@ export default function ReportPage() {
             </section>
           )}
         </article>
+        )}
       </main>
 
       {/* 右：知识库（证据 + 术语表） */}
@@ -634,10 +672,37 @@ export default function ReportPage() {
             </div>
           )}
 
-          <div className="mb-3 text-tag font-semibold text-ink-3">证据来源（{r.evidence.length}）</div>
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <span className="text-tag font-semibold text-ink-3">证据来源（{r.evidence.length}）</span>
+            <button
+              onClick={handleRefineEvidence}
+              disabled={refiningAll}
+              title="基于高可信度（≥70）证据重写报告正文"
+              className="inline-flex items-center gap-1.5 rounded-btn border border-primary-soft bg-primary-tint/50 px-2.5 py-1 text-tag font-medium text-primary-deep hover:bg-primary-tint disabled:opacity-50"
+            >
+              <Sparkles size={13} />
+              {refiningAll ? '精修中…' : '高质证据精修'}
+            </button>
+          </div>
+          {refiningAll && refineProgress && (
+            <div className="mb-3">
+              <div className="flex items-center justify-between text-tag text-ink-3">
+                <span className="truncate">{refineProgress.stage}</span>
+                <span className="shrink-0 pl-2">{refineProgress.percent}%</span>
+              </div>
+              <div className="mt-1 h-1.5 w-full overflow-hidden rounded-chip bg-line">
+                <div
+                  className="h-full rounded-chip bg-primary transition-all duration-200"
+                  style={{ width: `${refineProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
           <div className="flex flex-col gap-2.5">
             {r.evidence.map((ev, i) => (
-              <VEvidenceCard key={ev.evidence_id} ev={ev} index={i} highlighted={highlightedEv.includes(ev.evidence_id)} />
+              <div key={ev.evidence_id} className="group/ev relative">
+                <VEvidenceCard ev={ev} index={i} highlighted={highlightedEv.includes(ev.evidence_id)} />
+              </div>
             ))}
           </div>
 

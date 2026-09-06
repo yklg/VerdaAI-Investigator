@@ -6,6 +6,7 @@ import type {
   EvidenceQueryResp,
   Expert,
   ExpertWorkload,
+  PingLLMResp,
   Report,
   ReportCard,
   ReportSection,
@@ -15,6 +16,7 @@ import type {
   SettingsValues,
   Subscription,
   TraceSpan,
+  ReportBrief,
 } from '../types'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? ''
@@ -83,14 +85,10 @@ export async function saveSettings(patch: SettingsValues): Promise<SaveSettingsR
 }
 
 /** 连接测试：调 /api/llm/ping 验证当前 Key 是否可用。 */
-export async function pingLLM(): Promise<{
-  ok: boolean
-  model?: string
-  message?: string
-}> {
+export async function pingLLM(): Promise<PingLLMResp> {
   try {
     const r = await fetch(`${API_BASE}/api/llm/ping`)
-    return (await r.json()) as { ok: boolean; model?: string; message?: string }
+    return (await r.json()) as PingLLMResp
   } catch (e) {
     return { ok: false, message: String(e) }
   }
@@ -172,6 +170,26 @@ export async function fetchReports(): Promise<ReportCard[]> {
   return safeJson<ReportCard[]>('/api/reports', undefined, [])
 }
 
+export async function deleteReport(reportId: string): Promise<{ ok: boolean }> {
+  return safeJson(`/api/reports/${reportId}`, { method: 'DELETE' }, { ok: true })
+}
+
+/* 一页纸精炼（简报）：幂等生成并返回；失败（HTTP 非 2xx / 网络异常）必须显式抛出并提供错误信息。 */
+export async function generateReportBrief(
+  reportId: string,
+): Promise<{ ok?: boolean; brief?: ReportBrief; message?: string }> {
+  const r = await fetch(`${API_BASE}/api/reports/${reportId}/brief`, { method: 'POST' })
+  const data = (await r.json().catch(() => ({}))) as {
+    ok?: boolean
+    brief?: ReportBrief
+    message?: string
+  }
+  if (!r.ok) {
+    throw new Error(data.message || `生成失败（HTTP ${r.status}）`)
+  }
+  return data
+}
+
 /* 仪表盘真实统计 */
 export async function fetchDashboard(): Promise<DashboardStats | null> {
   return safeJson<DashboardStats | null>('/api/dashboard', undefined, null)
@@ -182,16 +200,38 @@ export async function fetchEvidences(params?: {
   brand?: string
   source_type?: string
   min_cred?: number
+  /** 证据归属过滤：'<rid>' = 仅该报告证据；不传 = 全部证据。 */
+  report_id?: string
 }): Promise<EvidenceQueryResp> {
   const qs = new URLSearchParams()
   if (params?.brand) qs.set('brand', params.brand)
   if (params?.source_type) qs.set('source_type', params.source_type)
   if (params?.min_cred != null) qs.set('min_cred', String(params.min_cred))
+  if (params?.report_id != null) qs.set('report_id', params.report_id)
   const suffix = qs.toString() ? `?${qs.toString()}` : ''
   return safeJson<EvidenceQueryResp>(`/api/evidences${suffix}`, undefined, {
     items: [],
     facets: { total: 0, by_type: {}, by_brand: {} },
   })
+}
+
+/* 基于新归属的高可信度证据异步精修报告，返回 taskId（订阅 /api/tasks/{taskId}/stream 拿进度）。 */
+export async function refineReportEvidence(
+  reportId: string,
+  opts: { evidence_ids?: string[]; min_cred?: number } = {},
+): Promise<{ taskId: string }> {
+  const body: Record<string, unknown> = {}
+  if (opts.evidence_ids && opts.evidence_ids.length > 0) body.evidence_ids = opts.evidence_ids
+  if (opts.min_cred != null) body.min_cred = opts.min_cred
+  return safeJson<{ taskId: string }>(
+    `/api/reports/${reportId}/refine-evidence`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    { taskId: '' },
+  )
 }
 
 /* 竞品监控订阅 */
@@ -212,7 +252,8 @@ export async function createSubscription(query: string, brands: string[]): Promi
 }
 
 export async function deleteSubscription(subId: string): Promise<{ ok: boolean }> {
-  return safeJson(`/api/subscriptions/${subId}`, { method: 'DELETE' }, { ok: true })
+  // 同上：写操作失败必须显式暴露，不做静默兜底。
+  return safeJson<{ ok: boolean }>(`/api/subscriptions/${subId}`, { method: 'DELETE' })
 }
 
 /* 专家工作量看板 */
@@ -265,7 +306,7 @@ export function openTaskStream(taskId: string, handlers: SSEHandlers): () => voi
 export function openClarifyStream(taskId: string, handlers: ClarifySSEHandlers): () => void {
   const url = `${API_BASE}/api/tasks/${taskId}/clarify/stream`
   const es = new EventSource(url)
-  const types: ClarifySSEEventType[] = ['clarify_stage', 'clarify_ready', 'error']
+  const types: ClarifySSEEventType[] = ['clarify_stage', 'clarify_ready', 'clarify_update', 'error']
   es.onopen = () => handlers.onOpen?.()
   for (const t of types) {
     es.addEventListener(t, (ev) => {

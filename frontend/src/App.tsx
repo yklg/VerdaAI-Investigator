@@ -10,6 +10,7 @@ import TracePage from './pages/TracePage'
 import ExpertsPage from './pages/ExpertsPage'
 import ExpertDetailPage from './pages/ExpertDetailPage'
 import LibraryPage from './pages/LibraryPage'
+import SlidesPage from './pages/SlidesPage'
 import DashboardPage from './pages/DashboardPage'
 import KnowledgePage from './pages/KnowledgePage'
 import SettingsPage from './pages/SettingsPage'
@@ -45,6 +46,7 @@ export default function App() {
         <Route path="/clarify/:taskId" element={<ClarifyPage />} />
         <Route path="/workspace/:taskId" element={<WorkspacePage />} />
         <Route path="/report/:reportId" element={<ReportPage />} />
+        <Route path="/report/:reportId/slides" element={<SlidesPage />} />
         <Route path="/graph/:reportId" element={<GraphPage />} />
         <Route path="/trace/:reportId" element={<TracePage />} />
 

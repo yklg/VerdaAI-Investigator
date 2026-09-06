@@ -324,6 +324,20 @@ describe('T-AutoAdvance 自动前进（单选 + 多选）', () => {
     await waitFor(() => expect(screen.getByText('目标市场是？')).toBeTruthy(), { timeout: 2500 })
   })
 
+  it('TC-AA8 competitors 单步自定义补充后同样停顿自动前进（走 maybeAdvance 统一路径）', async () => {
+    mockReady([
+      { id: 'competitors', question: '重点调研哪些竞品？', type: 'multi' as const, options: ['竞品A'] },
+      { id: 'q2', question: '目标市场是？', type: 'single' as const, options: ['国内', '海外'] },
+    ])
+    renderClarify('t_aa8')
+    await screen.findByText('重点调研哪些竞品？')
+    const input = screen.getByPlaceholderText(/补充其他想调研的竞品/)
+    fireEvent.change(input, { target: { value: '自研新品' } })
+    fireEvent.click(screen.getByText('添加')) // 自定义补充 → 经 maybeAdvance 排程（验证 schedule 形参已移除）
+    expect(await screen.findByText('完成本题')).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('目标市场是？')).toBeTruthy(), { timeout: 2500 })
+  })
+
   it('TC-AA4 文本题输入后不自动前进（需显式确认）', async () => {
     mockReady([
       { id: 'q1', question: '补充背景信息', type: 'text' as const, options: [] },
@@ -385,16 +399,74 @@ describe('T-Ax ClarifyPage SSE onError 通道（S1+S2 回归）', () => {
     expect(closeSpy).toHaveBeenCalled()
   })
 
-  it('TC-A4 degraded:true → 渲染降级提示', async () => {
-    mockedOpenClarifyStream.mockImplementation((_tid, handlers) => {
-      handlers.onEvent('clarify_ready', {
+  it('TC-A4 clarify_update(competitors_fallback) → 核对屏温和提示（C6，替代旧 degraded 大警告）', async () => {
+    let handlers: any = null
+    mockedOpenClarifyStream.mockImplementation((_tid, h) => { handlers = h; return () => {} })
+    renderClarify('t_c6')
+    // 基础题即时（partial）+ 竞品发现兜底到达（clarify_update, competitors_fallback）
+    act(() => {
+      handlers?.onEvent('clarify_ready', {
         questions: [{ id: 'focus', question: '最看重哪些维度？', type: 'multi', options: ['功能'] }],
-        degraded: true,
+        partial: true,
       })
-      return () => {}
+      handlers?.onEvent('clarify_update', {
+        questions: [
+          { id: 'focus', question: '最看重哪些维度？', type: 'multi', options: ['功能'] },
+          { id: 'competitors', question: '重点调研哪些竞品？', type: 'multi', options: ['竞品A'] },
+        ],
+        competitors_fallback: true,
+        complete: true,
+      })
     })
-    renderClarify('t_degraded')
-    expect(await screen.findByText(/已使用默认问卷/)).toBeTruthy()
+    // 推进到核对屏：第 0 题 focus → 第 1 题 competitors → 第 2 题（review）
+    fireEvent.click(screen.getByText('下一步'))
+    fireEvent.click(screen.getByText('下一步'))
+    expect(await screen.findByText('请核对，可直接修改')).toBeTruthy()
+    expect(screen.getByText(/以下竞品为自动识别候选，建议核对或手动补充/)).toBeTruthy()
+    // 旧的大警告文案必须消失（C6：不再弹「AI 不可用」）
+    expect(screen.queryByText(/已使用默认问卷/)).toBeNull()
+  })
+
+  it('TC-A8 clarify_update 增量追加竞品题到末尾（C4），且保留当前步不漂移', async () => {
+    let handlers: any = null
+    mockedOpenClarifyStream.mockImplementation((_tid, h) => { handlers = h; return () => {} })
+    renderClarify('t_c4')
+    // 基础题即时（partial）：只有 focus + perspective，scope/competitors 尚未出现
+    act(() => {
+      handlers?.onEvent('clarify_ready', {
+        questions: [
+          { id: 'focus', question: '最看重哪些维度？', type: 'multi', options: ['功能'] },
+          { id: 'perspective', question: '视角？', type: 'single', options: ['PM'] },
+        ],
+        partial: true,
+      })
+    })
+    expect(await screen.findByText('最看重哪些维度？')).toBeTruthy()
+    expect(screen.queryByText(/请确认我们理解的调研对象/)).toBeNull()
+    expect(screen.queryByText(/自动发现了以下候选竞品/)).toBeNull()
+    // 竞品发现完成 → 增量追加到末尾（scope + competitors），当前步不变
+    act(() => {
+      handlers?.onEvent('clarify_update', {
+        questions: [
+          { id: 'focus', question: '最看重哪些维度？', type: 'multi', options: ['功能'] },
+          { id: 'perspective', question: '视角？', type: 'single', options: ['PM'] },
+          { id: 'scope', question: '请确认我们理解的调研对象是否准确？', type: 'single', options: ['准确，继续', '不准确'] },
+          { id: 'competitors', question: '自动发现了以下候选竞品，请勾选', type: 'multi', options: ['竞品A'] },
+        ],
+        competitors_fallback: false,
+        complete: true,
+      })
+    })
+    // 当前仍停在 focus（步未漂移），但新题已在末尾、推进后可达
+    expect(screen.getByText('最看重哪些维度？')).toBeTruthy()
+    // focus → perspective
+    fireEvent.click(screen.getByText('下一步'))
+    // perspective → scope（竞品发现追加的 scope 题）
+    fireEvent.click(screen.getByText('下一步'))
+    expect(await screen.findByText(/请确认我们理解的调研对象是否准确/)).toBeTruthy()
+    // scope → competitors（竞品发现追加的 competitors 题）
+    fireEvent.click(screen.getByText('下一步'))
+    expect(await screen.findByText(/自动发现了以下候选竞品/)).toBeTruthy()
   })
 
   it('TC-A5 点击重试重新拉起 SSE', async () => {

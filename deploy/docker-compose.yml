@@ -1,0 +1,42 @@
+# 路径② 自管云主机（复用阿里云 ECS 47.114.101.59 等）
+# 仅 verda-worker 单服务：SQLite 落命名卷 verda_data，单实例（workers=1 硬约束）。
+#
+# 构建上下文 ..（本文件在 deploy/，Dockerfile 在仓库根）。
+# 启动：docker compose -f deploy/docker-compose.yml up -d
+# 密钥从同目录 .env 注入（见 .env.worker.example）；不要写死在本文。
+
+services:
+  verda-worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: verda-worker:latest
+    container_name: verda-worker
+    restart: unless-stopped
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      VERDA_DB_PATH: "/data/verda.db"
+      # 以下密钥从同级 .env 注入；未设则用 config.py 默认值（LLM 未配置 → 健康检查 ok:false）
+      LLM_API_KEY: "${LLM_API_KEY}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"
+      LLM_MODEL: "${LLM_MODEL:-glm-5.1}"
+      LLM_MODEL_CORE: "${LLM_MODEL_CORE:-glm-5.2}"
+      LLM_MODEL_AUX: "${LLM_MODEL_AUX:-glm-5.1}"
+      LLM_MODEL_FAST: "${LLM_MODEL_FAST:-glm-z1-air}"
+      LLM_TIMEOUT: "${LLM_TIMEOUT:-180}"
+      LLM_MAX_RETRIES: "${LLM_MAX_RETRIES:-1}"
+      BOCHA_API_KEY: "${BOCHA_API_KEY}"
+      BOCHA_BASE_URL: "${BOCHA_BASE_URL:-https://api.bocha.cn/v1}"
+      DOUYIN_COOKIE: "${DOUYIN_COOKIE:-}"
+      XHS_COOKIE: "${XHS_COOKIE:-}"
+      BILIBILI_COOKIE: "${BILIBILI_COOKIE:-}"
+      ENABLE_DEMO_FALLBACK: "${ENABLE_DEMO_FALLBACK:-true}"
+    volumes:
+      - verda_data:/data
+    # 不直暴公网；由宿主 Nginx 反代到 127.0.0.1:8000
+    expose:
+      - "8000"
+
+volumes:
+  verda_data:

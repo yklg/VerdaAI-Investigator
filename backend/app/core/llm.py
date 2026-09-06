@@ -23,6 +23,51 @@ class LLMNotConfigured(RuntimeError):
     """未配置 LLM API Key。"""
 
 
+class LLMModelUnavailable(RuntimeError):
+    """模型不可用（厂商已下架/重命名/无权访问）。
+
+    携带厂商在错误响应里给出的建议模型，供上层给出「一键迁移」入口。
+    """
+
+    def __init__(self, message: str, suggested_model: str | None = None):
+        super().__init__(message)
+        self.suggested_model = suggested_model
+
+
+def _parse_model_unavailable(err: Exception) -> tuple[str | None, str | None]:
+    """从厂商错误消息里提取「当前模型名」和「建议模型名」。
+
+    评审 P1 加固：先确认消息表达「模型不可用」，再提取，避免 401/429 等
+    错误文案里夹带的 `models/xxx` 片段被误判为可迁移建议。
+    """
+    msg = str(err)
+    if not re.search(
+        r"(?:no longer available|does not exist|not found|unavailable|deprecated|is not supported)",
+        msg,
+        re.I,
+    ):
+        return (None, None)
+    # Gemini: "This model models/gemini-2.5-pro is no longer available ... use models/gemini-3.1-pro-preview"
+    # OpenAI: "The model `gpt-foo` does not exist" / "does not exist or you do not have access"
+    # 优先提取带强意图（use / update / try）的建议模型
+    suggested = re.search(r"(?:use|update|try).*?models?/([\w\-.]+)", msg, re.I)
+    current = re.search(r"models?/([\w\-.]+)", msg, re.I)
+    return (
+        current.group(1) if current else None,
+        suggested.group(1) if suggested else None,
+    )
+
+
+def _raise_if_model_unavailable(err: Exception) -> None:
+    """若 err 是「模型不可用」且能提取建议模型，转抛 LLMModelUnavailable；否则原样 raise。"""
+    if _is_rate_limit(err):
+        raise err
+    _, suggested = _parse_model_unavailable(err)
+    if suggested:
+        raise LLMModelUnavailable(str(err), suggested_model=suggested) from err
+    raise err
+
+
 _client: OpenAI | None = None
 # 客户端签名：记录建客户端时用的配置。签名变化即重建，
 # 使界面改配置后**无需重启**立即生效（根治 RC2）。
@@ -45,6 +90,19 @@ _RATE_LIMIT_BACKOFFS = [4.0, 8.0, 15.0, 25.0]
 def _is_rate_limit(err: Exception) -> bool:
     msg = str(err)
     return "429" in msg or "rate" in msg.lower() or "1302" in msg
+
+
+def is_temporary_unavailable(err: Exception) -> bool:
+    """评审 P1-a：仅当 HTTP 503 且命中 Google 临时高负载文案特征时判定为临时不可用。
+
+    必须同时满足「503 状态码」+「Google 文案特征」，避免把「永久下架也返回 503」
+    的厂商误当可重试并误导用户「稍后重试」。
+    """
+    msg = str(err)
+    is_503 = getattr(err, "status_code", None) == 503 or "503" in msg
+    if not is_503:
+        return False
+    return bool(re.search(r"(high demand|temporarily|unavailable|overloaded)", msg, re.I))
 
 
 def _get_client() -> OpenAI:
@@ -155,7 +213,7 @@ def chat(
         except Exception as e:  # noqa: BLE001
             last_err = e
             if not _is_rate_limit(e):
-                raise
+                _raise_if_model_unavailable(e)
     assert last_err is not None
     raise last_err
 
@@ -228,14 +286,19 @@ def chat_stream(
     """流式返回文本增量（供思维流逐条 append）。"""
     client = _get_client()
     use_model = model or get_effective_settings().get("llm_model")
-    stream = client.chat.completions.create(
-        model=use_model,
-        messages=messages,  # type: ignore[arg-type]
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
-    )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+    try:
+        stream = client.chat.completions.create(
+            model=use_model,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except LLMModelUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _raise_if_model_unavailable(e)

@@ -50,7 +50,7 @@ export type SSEEventType =
   | 'error'
 
 /* 澄清问卷 SSE 事件（CreateTaskResp 不再携带问卷，改为 ClarifyPage 内 SSE 懒加载） */
-export type ClarifySSEEventType = 'clarify_stage' | 'clarify_ready' | 'error'
+export type ClarifySSEEventType = 'clarify_stage' | 'clarify_ready' | 'clarify_update' | 'error'
 
 export interface ClarifySSEHandlers {
   onEvent: (type: ClarifySSEEventType, data: unknown) => void
@@ -215,6 +215,18 @@ export interface Report {
   quality_after?: Record<string, unknown>
   audit_review?: AuditReview
   trace?: TraceSpan[]
+  /** 一页纸精炼（派生数据，懒生成落库；报告内容变更后失效） */
+  brief?: ReportBrief
+  /** LLM 生成失败时间戳（ISO）；距今 <30s 时前端冷却防止重复触发 */
+  brief_failed_at?: string
+}
+
+/** 一页纸精炼简报：把整份报告压缩为汇报要点 */
+export interface ReportBrief {
+  summary: string
+  judgments: string[]
+  key_data: string[]
+  actions: string[]
 }
 
 export interface AuditOpinion {
@@ -369,3 +381,14 @@ export interface SettingsResp {
 }
 
 export type SaveSettingsResp = Omit<SettingsResp, 'secrets' | 'groups'>
+
+/** 连接测试（/api/llm/ping）响应。reason=model_unavailable 时携带建议迁移模型。 */
+export interface PingLLMResp {
+  ok: boolean
+  model?: string
+  message?: string
+  /** 失败原因枚举：not_configured / model_unavailable / error */
+  reason?: string
+  /** 厂商在 404 错误中给出的建议模型（如 gemini-3.1-pro-preview） */
+  suggested_model?: string
+}

@@ -121,12 +121,15 @@ export function VModal({
   onClose,
   title,
   width = 780,
+  height = 'min(720px,85vh)',
   children,
 }: {
   open: boolean
   onClose: () => void
   title: ReactNode
   width?: number
+  /** 弹窗高度。默认 'min(720px,85vh)'（Settings 等大面板）；紧凑表单可传更小值，如 'min(360px,80vh)'。 */
+  height?: string
   children: ReactNode
 }) {
   useEffect(() => {
@@ -150,8 +153,8 @@ export function VModal({
       <div className="absolute inset-0 bg-ink/40 backdrop-blur-[2px]" onClick={onClose} />
       {/* 居中卡：固定高度避免切 tab 时 content-driven 伸缩；h-[min(720px,85vh)] 兼顾小屏与桌面 */}
       <div
-        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex h-[min(720px,85vh)] flex-col bg-card shadow-float border border-line/60 rounded-card"
-        style={{ width, maxWidth: 'calc(100vw - 32px)' }}
+        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col bg-card shadow-float border border-line/60 rounded-card"
+        style={{ width, maxWidth: 'calc(100vw - 32px)', height }}
       >
         {/* 标题行 */}
         <div className="flex shrink-0 items-center justify-between gap-4 border-b border-line/50 px-6 py-4">

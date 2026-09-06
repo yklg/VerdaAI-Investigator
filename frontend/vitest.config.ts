@@ -11,5 +11,8 @@ export default {
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
     globals: false,
+    // jsdom 环境 localStorage 补水（Node 26 实验性全局 Web Storage 与
+    // vitest 2.x / jsdom 30 组合的兼容适配，见 vitest.setup.ts）
+    setupFiles: ['./vitest.setup.ts'],
   },
 }

@@ -9,24 +9,13 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from app.core.llm import chat_json
+from app.core.platforms import PLATFORMS
 
-# 各平台站内检索域名（供 orchestrator 做 site: 搜索）
-PLATFORM_SITES = {
-    "douyin": "douyin.com",
-    "xiaohongshu": "xiaohongshu.com",
-    "bilibili": "bilibili.com",
-    "weibo": "weibo.com",
-    "zhihu": "zhihu.com",
-}
-
-PLATFORM_ORDER = ["douyin", "xiaohongshu", "bilibili", "weibo", "zhihu"]
-PLATFORM_LABEL = {
-    "douyin": "抖音",
-    "xiaohongshu": "小红书",
-    "bilibili": "B站",
-    "weibo": "微博",
-    "zhihu": "知乎",
-}
+# 各平台元数据统一从平台注册表（app.core.platforms）派生，避免多份注册表漂移。
+# 注：抖音永远排第一（与历史行为一致）。
+PLATFORM_SITES = {k: p.search_site for k, p in PLATFORMS.items()}
+PLATFORM_ORDER = list(PLATFORMS.keys())
+PLATFORM_LABEL = {k: p.label for k, p in PLATFORMS.items()}
 
 _POS = ["好", "强", "喜欢", "推荐", "优秀", "值得", "香", "爱了", "性价比", "流畅", "丝滑", "靠谱"]
 _NEG = ["差", "贵", "卡", "失望", "垃圾", "退", "坑", "难用", "bug", "缺点", "拉胯", "翻车"]

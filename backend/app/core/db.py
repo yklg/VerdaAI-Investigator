@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -164,6 +165,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             value TEXT,
             updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS competitor_discovery_cache (
+            qhash TEXT PRIMARY KEY,
+            payload TEXT,
+            expires_at TEXT,
+            created_at TEXT
+        );
         """
     )
     conn.commit()
@@ -185,10 +192,31 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ("started_at", "TEXT"),
             ("updated_at", "TEXT"),
             ("error", "TEXT"),
+            ("kind", "TEXT"),
         ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype}")
         conn.commit()
+    except sqlite3.Error:
+        pass
+
+    # 迁移：存量库 evidences 表可能缺 report_id 列（旧库不自动加列）。
+    # 证据归属依赖该列（INSERT 显式写 report_id）。带列存在性检查，幂等。
+    try:
+        ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(evidences)").fetchall()]
+        if "report_id" not in ev_cols:
+            conn.execute("ALTER TABLE evidences ADD COLUMN report_id TEXT")
+            conn.commit()
+    except sqlite3.Error:
+        pass
+
+    # 启动回填：存量报告证据写进 evidences 表（单一真相源），幂等。
+    # 注意：必须先置 _SCHEMA_READY=True 再调 backfill——否则 backfill 内部的
+    # _connect() 会再次触发 _ensure_schema → 重入 _init_schema → 无限递归卡死。
+    global _SCHEMA_READY
+    _SCHEMA_READY = True
+    try:
+        backfill_evidences_from_reports()
     except sqlite3.Error:
         pass
 
@@ -270,13 +298,13 @@ def migrate_settings(mapping: Dict[str, str]) -> int:
 
 
 # ── 任务 ────────────────────────────────────────────────
-def save_task(task_id: str, query: str, clarifications: Dict[str, Any]) -> None:
+def save_task(task_id: str, query: str, clarifications: Dict[str, Any], kind: str = "research") -> None:
     with _LOCK:
         c = _connect()
         c.execute(
-            "INSERT OR REPLACE INTO tasks(task_id,query,clarifications,status,created_at,report_id)"
-            " VALUES(?,?,?,?,?,COALESCE((SELECT report_id FROM tasks WHERE task_id=?),NULL))",
-            (task_id, query, json.dumps(clarifications, ensure_ascii=False), "created", _now(), task_id),
+            "INSERT OR REPLACE INTO tasks(task_id,query,clarifications,status,created_at,report_id,kind)"
+            " VALUES(?,?,?,?,?,COALESCE((SELECT report_id FROM tasks WHERE task_id=?),NULL),?)",
+            (task_id, query, json.dumps(clarifications, ensure_ascii=False), "created", _now(), task_id, kind),
         )
         c.commit()
 
@@ -380,10 +408,67 @@ def reconcile_orphan_runs() -> int:
         return n
 
 
+# ── 竞品发现缓存（按 query 哈希，TTL 过期；仅缓存成功发现，兜底结果不缓存）──
+def _query_hash(query: str) -> str:
+    """归一化（去空白、转小写）后 sha256，作为发现缓存键。"""
+    import hashlib
+
+    return hashlib.sha256(query.strip().lower().encode("utf-8")).hexdigest()
+
+
+def get_discovery_cache(qhash: str) -> Optional[Dict[str, Any]]:
+    """读取未过期的竞品发现缓存；过期/缺失返回 None。"""
+    c = _connect()
+    row = c.execute(
+        "SELECT payload, expires_at FROM competitor_discovery_cache WHERE qhash=?",
+        (qhash,),
+    ).fetchone()
+    if not row:
+        return None
+    if row["expires_at"] and row["expires_at"] < _now():
+        return None
+    try:
+        return json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def save_discovery_cache(qhash: str, scope: Dict[str, Any], ttl_days: int = 7) -> None:
+    """写入竞品发现缓存（带过期时间）。幂等（INSERT OR REPLACE）。"""
+    from datetime import timedelta
+
+    exp = (_dt.datetime.now() + timedelta(days=ttl_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    payload = json.dumps(scope, ensure_ascii=False)
+    with _LOCK:
+        c = _connect()
+        c.execute(
+            "INSERT OR REPLACE INTO competitor_discovery_cache(qhash,payload,expires_at,created_at)"
+            " VALUES(?,?,?,?)",
+            (qhash, payload, exp, _now()),
+        )
+        c.commit()
+
+
+def clear_discovery_cache() -> None:
+    """清空竞品发现缓存（测试隔离 / 手动刷新用）。"""
+    with _LOCK:
+        c = _connect()
+        c.execute("DELETE FROM competitor_discovery_cache")
+        c.commit()
+
+
 # ── 澄清问卷（懒生成，SSE 推送给前端）─────────────────────
-def save_clarify_questions(task_id: str, questions: List[Dict[str, Any]]) -> None:
-    """落库懒生成的澄清问卷；payload 统一为 {"questions": [...]}（与 SSE clarify_ready 一致）。"""
-    payload = json.dumps({"questions": questions}, ensure_ascii=False)
+def save_clarify_questions(
+    task_id: str, questions: List[Dict[str, Any]], complete: bool = True
+) -> None:
+    """落库懒生成的澄清问卷；payload 统一为 {"questions": [...], "complete": bool}。
+
+    complete 仅当整份问卷（含竞品发现）已就绪时为 True；partial（仅基础题）绝不落库，
+    避免重连时只推回半份问卷（P0-③ 重连完整性）。
+    """
+    payload = json.dumps(
+        {"questions": questions, "complete": bool(complete)}, ensure_ascii=False
+    )
     with _LOCK:
         c = _connect()
         cur = c.execute(
@@ -400,21 +485,30 @@ def save_clarify_questions(task_id: str, questions: List[Dict[str, Any]]) -> Non
         c.commit()
 
 
-def get_clarify_questions(task_id: str) -> Optional[Dict[str, Any]]:
-    """读取已生成的澄清问卷；未生成/为空返回 None（SSE 据此决定重新生成）。"""
+def get_clarify_questions(task_id: str) -> "tuple[Optional[Dict[str, Any]], bool]":
+    """读取已生成的澄清问卷。
+
+    返回 (payload_dict, complete)：
+    - 未生成/为空 → (None, False)（SSE 据此重新生成）。
+    - 已落库 → (payload, complete)；旧库无 complete 字段视为完整（向后兼容）。
+    仅当 complete=True 才视为可直推的完整问卷（重连完整性守卫）。
+    """
     c = _connect()
     row = c.execute(
         "SELECT clarify_questions FROM tasks WHERE task_id=?", (task_id,)
     ).fetchone()
     if not row:
-        return None
+        return None, False
     raw = row["clarify_questions"]
     if not raw:
-        return None
+        return None, False
     try:
-        return json.loads(raw)
+        d = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return None, False
+    if not isinstance(d, dict) or not d.get("questions"):
+        return None, False
+    return d, bool(d.get("complete", True))
 
 
 # ── 报告 + 证据 ─────────────────────────────────────────
@@ -452,12 +546,73 @@ def save_report(report: Dict[str, Any], task_id: str = "") -> None:
         c.commit()
 
 
+# --------------------------------------------------------------------------- #
+# 证据读取
+# --------------------------------------------------------------------------- #
+def get_evidence(evidence_id: str) -> Optional[Dict[str, Any]]:
+    """按 evidence_id 读取单条证据（含 report_id 归属）。"""
+    c = _connect()
+    row = c.execute("SELECT * FROM evidences WHERE evidence_id=?", (evidence_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def backfill_evidences_from_reports() -> None:
+    """启动一次性回填：把存量报告的 data.evidence 写进 evidences 表（单一真相源）。
+
+    幂等（INSERT OR REPLACE，按 evidence_id 主键）。在 _init_schema 末尾调用，
+    使旧库/旧报告的证据进入 evidences 表，让 Option B 的 get_report 实时派生生效。
+    """
+    with _LOCK:
+        c = _connect()
+        rows = c.execute("SELECT report_id, data FROM reports").fetchall()
+        for r in rows:
+            rid = r["report_id"]
+            try:
+                data = json.loads(r["data"]) if r["data"] else {}
+            except Exception:
+                data = {}
+            for ev in data.get("evidence", []) or []:
+                eid = ev.get("evidence_id")
+                if not eid:
+                    continue
+                c.execute(
+                    "INSERT OR REPLACE INTO evidences("
+                    "evidence_id,report_id,source_url,source_type,domain,title,excerpt,"
+                    "credibility,collected_by,brand,captured_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        eid, rid, ev.get("source_url", ""), ev.get("source_type", ""),
+                        ev.get("domain", ""), ev.get("title", ""),
+                        (ev.get("excerpt", "") or "")[:500], ev.get("credibility", 0.0),
+                        ev.get("collected_by", ""), ev.get("brand", ""),
+                        ev.get("captured_at", _now()),
+                    ),
+                )
+        c.commit()
+
+
 def get_report(report_id: str) -> Optional[Dict[str, Any]]:
+    """读取报告正文，并实时派生 `evidence`（单一真相源，Option B 根因修复）。
+
+    行为：
+      - 报告正文其余部分仍来自 reports.data 静态快照。
+      - `evidence` 数组改为按 report_id 实时查 evidences 表并覆盖 data["evidence"]。
+        由于 save_report / backfill 早已把报告证据以正确 report_id 写入该表，
+        存量报告零改动即生效；分配动作（UPDATE report_id）也会自动反映。
+      - 评审 P2 兜底：live 查询异常时回退到 data["evidence"]，绝不丢证据、绝不抛错。
+    """
     c = _connect()
     row = c.execute("SELECT data FROM reports WHERE report_id=?", (report_id,)).fetchone()
     if not row:
         return None
-    return json.loads(row["data"])
+    data = json.loads(row["data"])
+    try:
+        evs = list(query_evidences(report_id=report_id))
+    except Exception:
+        evs = []
+    if evs:
+        # live 有则覆盖快照；否则保留 data["evidence"]（兜底，不丢证据）
+        data["evidence"] = evs
+    return data
 
 
 def list_reports() -> List[Dict[str, Any]]:
@@ -477,16 +632,88 @@ def list_reports() -> List[Dict[str, Any]]:
     return out
 
 
+def delete_report(report_id: str) -> bool:
+    """删除报告并级联清理关联数据（单一真相源，避免孤儿行）。
+
+    级联表及关联列（均按 report_id 弱关联）：
+      - evidences(report_id)   证据溯源
+      - traces(report_id)      决策链路
+      - report_feedback(report_id) 人工修正反馈
+      - tasks(report_id)       关联任务（标记完成的那条）
+    订阅表 last_report_id 仅引用、不阻断删除，故不联动。
+    """
+    with _LOCK:
+        c = _connect()
+        c.execute("DELETE FROM evidences WHERE report_id=?", (report_id,))
+        c.execute("DELETE FROM traces WHERE report_id=?", (report_id,))
+        c.execute("DELETE FROM report_feedback WHERE report_id=?", (report_id,))
+        c.execute("DELETE FROM tasks WHERE report_id=?", (report_id,))
+        c.execute("DELETE FROM reports WHERE report_id=?", (report_id,))
+        c.commit()
+    return True
+
+
+@contextmanager
+def locked():
+    """暴露写锁临界区（RLock，可重入）。供派生数据读-算-写回需要整体串行的调用方使用。"""
+    with _LOCK:
+        yield
+
+
+def invalidate_report_brief(report_id: str) -> None:
+    """派生数据失效即淘汰：清除 data 中的 brief / brief_failed_at（幂等，不存在不报错）。
+
+    报告内容变更通道（refine / refine-evidence / feedback）成功后必须调用，
+    保证简报/一页纸精炼永远反映最新正文，不呈现陈旧结论。
+    """
+    with _LOCK:
+        c = _connect()
+        row = c.execute("SELECT data FROM reports WHERE report_id=?", (report_id,)).fetchone()
+        if not row:
+            return
+        data = json.loads(row["data"])
+        changed = False
+        if "brief" in data:
+            data.pop("brief", None)
+            changed = True
+        if "brief_failed_at" in data:
+            data.pop("brief_failed_at", None)
+            changed = True
+        if not changed:
+            return
+        c.execute(
+            "UPDATE reports SET data=?, evidence_count=?, claim_count=?, high_conf_count=? WHERE report_id=?",
+            (
+                json.dumps(data, ensure_ascii=False),
+                len(data.get("evidence", [])),
+                len(data.get("claims", [])),
+                sum(1 for cl in data.get("claims", []) if cl.get("confidence") == "high"),
+                report_id,
+            ),
+        )
+        c.commit()
+
+
 # ── 全局证据溯源库 ──────────────────────────────────────
 def query_evidences(
     brand: Optional[str] = None,
     source_type: Optional[str] = None,
     min_cred: float = 0.0,
     limit: int = 200,
+    report_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """全局证据溯源库查询。
+
+    report_id 过滤语义：
+      - None（默认）→ 全部证据（证据统一归属报告，无收件箱状态）
+      - '<rid>'     → 仅返回该报告证据
+    """
     c = _connect()
     sql = "SELECT * FROM evidences WHERE credibility>=?"
     args: List[Any] = [min_cred]
+    if report_id is not None:
+        sql += " AND report_id=?"
+        args.append(report_id)
     if brand:
         sql += " AND brand=?"
         args.append(brand)
@@ -511,7 +738,8 @@ def evidence_facets() -> Dict[str, Any]:
     by_brand = {
         r["brand"]: r["n"]
         for r in c.execute(
-            "SELECT brand, COUNT(*) n FROM evidences WHERE brand!='' GROUP BY brand ORDER BY n DESC LIMIT 12"
+            "SELECT brand, COUNT(*) n FROM evidences"
+            " WHERE brand!='' GROUP BY brand ORDER BY n DESC LIMIT 12"
         ).fetchall()
     }
     return {"total": total, "by_type": by_type, "by_brand": by_brand}

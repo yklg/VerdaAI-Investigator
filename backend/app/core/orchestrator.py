@@ -21,6 +21,7 @@ import datetime as _dt
 import json
 import re
 import time
+import urllib.parse
 import uuid
 from collections import Counter
 from contextvars import ContextVar
@@ -33,6 +34,7 @@ from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
 from app.core.runtime_config import get_effective_settings
 from app.core.credibility import score_evidence, freshness_days
 from app.core.fetcher import domain_of, fetch_page
+from app.core.platforms import classify_platform
 from app.core.llm import chat, chat_json, LLMNotConfigured, TOKEN_USAGE
 from app.core.metrics import compute_report_metrics, merge_quality_into_metrics
 from app.core.models import Evidence, Envelope, make_claim
@@ -173,19 +175,91 @@ def _fallback_clarify_questions(query: str) -> List[Dict[str, Any]]:
     ]
 
 
-async def generate_clarify(task_id: str, query: str) -> AsyncIterator[Dict[str, Any]]:
-    """懒生成澄清问卷，SSE 逐事件推送。
+def _baseline_questions(query: str = "") -> List[Dict[str, Any]]:
+    """即时基础题（不依赖 LLM），竞品发现完成前即可作答（P0-① 修复核心）。"""
+    return _fallback_clarify_questions(query)
 
-    - 通过 asyncio.to_thread 把同步阻塞的 _clarify_questions（含 DeepSeek HTTP）
-      移出事件循环（P0#1），否则 async 路由会阻塞所有并发请求（含并行调研）。
-    - 并发重入防护（P1#7）：首个协程把结果塞进 _GEN_INFLIGHT future，其余协程
-      await 同一 future 复用结果，绝不重复调 LLM。临界区（get DB → 建 future）
-      无 await，单线程内原子，杜绝 double generation。
-    - 生成失败降级为静态问卷（P1#5），流程不卡死。
+
+def _build_enhanced_questions(
+    scope: Dict[str, Any], baseline: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """把领域识别 + 竞品发现结果作为增强题追加到基础题末尾（P0-②：增量而非阻塞）。"""
+    subject = scope.get("subject") or ""
+    domain = scope.get("domain") or ""
+    competitors = scope.get("competitors") or []
+    if subject:
+        txt = f"我们识别到你要调研的是「{subject}」"
+        txt += f"，所属领域：{domain}。" if domain else "。"
+        txt += "是否准确？"
+    elif domain:
+        txt = f"我们识别到你要调研的主题属于「{domain}」领域，是否准确？"
+    else:
+        txt = "请确认我们理解的调研对象是否准确？"
+    extra: List[Dict[str, Any]] = [{
+        "id": "scope",
+        "question": txt,
+        "type": "single",
+        "options": ["准确，继续", "大致准确，下面补充", "不准确，我在下方说明"],
+        "hint": "若不准确，请在最后一题补充说明真实的调研对象与领域。",
+    }]
+    if competitors:
+        extra.append({
+            "id": "competitors",
+            "question": f"为「{subject or '该主题'}」自动发现了以下候选竞品，请勾选你希望重点对比的对象（可多选）：",
+            "type": "multi",
+            "options": competitors[:12],
+            "hint": "勾选后我们会确保每个竞品都被充分调研；如有遗漏可在最后一题补充。",
+        })
+    return list(baseline) + extra
+
+
+async def _discover_and_build(
+    task_id: str, query: str, baseline: List[Dict[str, Any]], timeout_s: float
+) -> Dict[str, Any]:
+    """竞品发现 + 增强题构建（带缓存命中 / 4s 超时 / 异常兜底）。
+
+    返回可直接作为 SSE clarify_update 载荷的字典：
+    {"questions": [...], "competitors_fallback": bool, "complete": True}。
+    - 缓存命中（仅成功发现才缓存）→ 零 LLM 调用。
+    - 超时 / 异常 → 正则兜底（competitors_fallback=True），绝不卡死。
+    - 仅完整问卷落库（complete=1），绝不落 partial（P0-③ 重连完整性）。
     """
-    # 已落库（重连/刷新）：直接推送，避免重复 LLM 调用
-    existing = db.get_clarify_questions(task_id)
-    if existing:
+    qhash = db._query_hash(query)
+    cached = db.get_discovery_cache(qhash)
+    if cached:
+        scope: Dict[str, Any] = cached
+        fallback = False
+    else:
+        try:
+            scope = await asyncio.wait_for(
+                asyncio.to_thread(_discover_scope, query), timeout=timeout_s
+            )
+        except Exception:
+            # 超时或 LLM 抛错 → 正则兜底（competitors_fallback），绝不卡死。
+            # 不捕获 CancelledError（BaseException），保证外部取消能正常透传。
+            scope = _discover_scope_fallback(query)
+        fallback = bool(scope.get("fallback", False))
+        # 仅缓存真实（非兜底）发现结果，避免把兜底噪声写进缓存
+        if not fallback and (scope.get("competitors") or scope.get("domain")):
+            ttl = int(get_effective_settings().get("discovery_cache_ttl_d", 7) or 7)
+            db.save_discovery_cache(qhash, scope, ttl_days=ttl)
+    enhanced = _build_enhanced_questions(scope, baseline)
+    db.save_clarify_questions(task_id, enhanced, complete=True)
+    return {"questions": enhanced, "competitors_fallback": fallback, "complete": True}
+
+
+async def generate_clarify(task_id: str, query: str) -> AsyncIterator[Dict[str, Any]]:
+    """懒生成澄清问卷，SSE 逐事件推送（分阶段：基础题即时 → 竞品发现增量）。
+
+    - asyncio.to_thread 把同步阻塞的 _discover_scope（含 DeepSeek HTTP）移出事件循环。
+    - 并发重入防护（P1#7）：首个协程把完整载荷塞进 _GEN_INFLIGHT future，其余协程
+      await 同一 future 复用结果，绝不重复调 LLM。
+    - 阶段 0/1 即时（无 LLM）：先推基础题（partial），竞品发现完再推 clarify_update。
+    - 生成失败降级为正则兜底（competitors_fallback），流程不卡死（P1#5）。
+    """
+    # 重连/刷新：完整问卷已落库 → 直接推送，避免重复 LLM 调用
+    existing, complete = db.get_clarify_questions(task_id)
+    if existing and complete:
         yield {"type": "clarify_ready", "data": existing}
         return
 
@@ -193,31 +267,165 @@ async def generate_clarify(task_id: str, query: str) -> AsyncIterator[Dict[str, 
     inflight = _GEN_INFLIGHT.get(task_id)
     if inflight is not None:
         # 并发重入：复用在途生成结果，不重复调 LLM
-        questions = await inflight
-        yield {"type": "clarify_ready", "data": {"questions": questions}}
+        payload = await inflight
+        yield {"type": "clarify_ready", "data": payload}
         return
 
     fut: "asyncio.Future" = loop.create_future()
     _GEN_INFLIGHT[task_id] = fut  # 原子写入（其后无 await，其它协程必见）
     try:
+        # 阶段 0：理解阶段（即时，无阻塞）
         yield {"type": "clarify_stage", "data": {"stage": "understanding", "message": "正在理解你的需求…"}}
+        # 阶段 1：基础题即时渲染（P0-① 修复：不等竞品发现）
+        baseline = _baseline_questions(query)
+        yield {"type": "clarify_ready", "data": {"questions": baseline, "partial": True}}
+        # 阶段 2：竞品发现（带超时 + 缓存 + 异常兜底，P0-②/③）
         yield {"type": "clarify_stage", "data": {"stage": "discovering", "message": "正在发现竞品…"}}
-        try:
-            questions = await asyncio.to_thread(_clarify_questions, query)
-            degraded = False
-        except Exception:
-            questions = _fallback_clarify_questions(query)
-            degraded = True
-        db.save_clarify_questions(task_id, questions)
+        timeout_s = float(get_effective_settings().get("clarify_discover_timeout_s", 4) or 4)
+        payload = await _discover_and_build(task_id, query, baseline, timeout_s)
         if not fut.done():
-            fut.set_result(questions)
-        yield {"type": "clarify_ready", "data": {"questions": questions, "degraded": degraded}}
+            fut.set_result(payload)
+        yield {"type": "clarify_update", "data": payload}
     except Exception as e:  # noqa: BLE001
         if not fut.done():
             fut.set_exception(e)
         raise
     finally:
         _GEN_INFLIGHT.pop(task_id, None)
+
+
+def _rewrite_section(section: Dict[str, Any], extra_context: Dict[str, Any],
+                     system_prompt: Optional[str] = None) -> Dict[str, Any]:
+    """基于补充材料（extra_context['digest']）重写单个章节段落，就地标注 refined + absorbed。
+
+    纯同步（内含阻塞 chat_json）；调用方在异步管线里须用 `await asyncio.to_thread(_rewrite_section, ...)`
+    包裹，避免冻结事件循环（P1-2，与 run_pipeline 的 to_thread 惯例一致）。
+    """
+    digest = extra_context.get("digest", "")
+    absorbed = extra_context.get("absorbed_evidence_ids", [])
+    existing = "\n".join(section.get("paragraphs", []))
+    try:
+        data = chat_json(
+            [
+                {"role": "system", "content": (
+                    system_prompt or
+                    "你是资深竞品分析师。请基于已有证据与补充材料，把该章节重写得更深、更厚、更有针对性——"
+                    "补充论证、数据、对比与独立判断。"
+                    '输出 JSON：{"paragraphs":["段落"],"key_takeaway":"核心判断","highlights":["亮点"]}。只输出 JSON。'
+                )},
+                {"role": "user", "content": (
+                    f"章节标题：{section.get('title','')}\n"
+                    f"补充证据：\n{digest}\n\n现有章节内容：\n{existing}"
+                )},
+            ],
+            max_tokens=6000, temperature=0.7,
+            model=_model("core"), purpose=f"基于新证据重写章节：{section.get('title','')}",
+        )
+        if isinstance(data, dict) and data.get("paragraphs"):
+            paras = [str(p).strip() for p in data["paragraphs"] if str(p).strip()]
+            if paras:
+                section["paragraphs"] = paras
+                if data.get("key_takeaway"):
+                    section["key_takeaway"] = str(data["key_takeaway"])
+                hl = data.get("highlights")
+                if isinstance(hl, list):
+                    section["highlights"] = [str(h) for h in hl if str(h).strip()]
+                section["refined"] = True
+                section["absorbed_evidence_ids"] = absorbed
+    except Exception:  # noqa: BLE001
+        # 单章失败不阻断其余章节；report 级错误由调用方处理
+        pass
+    return section
+
+
+def generate_brief(report_id: str) -> Optional[Dict[str, Any]]:
+    """把报告压缩为一页纸精炼（派生数据）并落库 reports.data.brief。
+
+    幂等：data.brief 已存在直接返回，不重复调 LLM（前端「AI 生成一页纸精炼」）。
+    失败：普通异常记录 data.brief_failed_at（供前端 ≥30s 冷却防重）后返回 None；
+         LLMNotConfigured 冒泡由 main 端点转 503。
+    并发：整段持 db.locked()（RLock 可重入，save_report 内部再取锁不冲突），
+         写回前重读校验 brief 仍为空才落盘，杜绝双写与"失效清除后被旧内容回填"。
+    """
+    with db.locked():
+        rep = db.get_report(report_id)
+        if not rep:
+            return None
+        if rep.get("brief"):
+            return rep["brief"]
+
+        sections = rep.get("sections", []) or []
+        sum_sec = next((s for s in sections if s.get("id") == "summary"), None)
+        takeaways = [s.get("key_takeaway") for s in sections if s.get("key_takeaway")]
+        summary_block = ""
+        if sum_sec:
+            lines = [f"- {h}" for h in (sum_sec.get("highlights") or [])[:5]]
+            summary_block = (
+                f"执行摘要核心判断：{sum_sec.get('key_takeaway', '')}\n"
+                f"执行摘要亮点：\n" + "\n".join(lines)
+            )
+        metrics = (rep.get("metrics") or {}).get("efficiency") or {}
+        metric_block = json.dumps({
+            "efficiency_multiple": metrics.get("efficiency_multiple"),
+            "elapsed_minutes": metrics.get("elapsed_minutes"),
+            "minutes_saved": metrics.get("minutes_saved"),
+            "tokens_used": metrics.get("tokens_used"),
+        }, ensure_ascii=False)
+        senti_block = json.dumps((rep.get("sentiment") or {}).get("overall", {}), ensure_ascii=False)
+
+        def _call_brief_llm() -> Dict[str, Any]:
+            data = chat_json(
+                [
+                    {"role": "system", "content": (
+                        "你是资深竞品分析汇报官。请把整份报告压缩成可直接用于汇报的一页纸精炼。"
+                        "输出 JSON：{\"summary\":\"一句话概括(≤40字)\",\"judgments\":[\"全局核心判断(3-5条，结论先行)\"],"
+                        "\"key_data\":[\"关键数据(3-5条，带数字)\"],\"actions\":[\"行动建议(3-5条)\"]}。只输出 JSON。"
+                    )},
+                    {"role": "user", "content": (
+                        f"报告标题：{rep.get('title', '')}\n副标题：{rep.get('subtitle', '')}\n"
+                        f"品牌：{rep.get('brands') or []}\n证据数：{len(rep.get('evidence', []))} "
+                        f"结论数：{len(rep.get('claims', []))}\n\n{summary_block}\n\n各章核心判断：\n"
+                        + "\n".join(f"- {t}" for t in takeaways[:12])
+                        + f"\n\n效能指标：{metric_block}\n舆情概览：{senti_block}"
+                    )},
+                ],
+                max_tokens=2400, temperature=0.3,
+                model=_model("core"), purpose=f"生成一页纸精炼：{report_id}",
+            )
+            if not isinstance(data, dict):
+                raise RuntimeError("LLM 未返回结构化精炼")
+            brief = {
+                "summary": str(data.get("summary", "")).strip(),
+                "judgments": [str(j).strip() for j in data.get("judgments", []) if str(j).strip()],
+                "key_data": [str(k).strip() for k in data.get("key_data", []) if str(k).strip()],
+                "actions": [str(a).strip() for a in data.get("actions", []) if str(a).strip()],
+            }
+            if not brief["summary"] and not brief["judgments"]:
+                raise RuntimeError("精炼结果为空")
+            return brief
+
+        try:
+            brief = _call_brief_llm()
+        except LLMNotConfigured:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # 可观测性：失败落 brief_failed_at 供前端冷却防重，同时留日志便于定位 LLM 层原因
+            import logging
+            logging.getLogger(__name__).warning("generate_brief 失败 report=%s: %s", report_id, e)
+            cur = db.get_report(report_id)
+            if cur and not cur.get("brief"):
+                cur["brief_failed_at"] = _now()
+                db.save_report(cur, task_id="")
+            return None
+
+        # 写回前重读校验：仍在锁内，若并发已生成则直接复用，避免覆盖
+        cur = db.get_report(report_id)
+        if cur.get("brief"):
+            return cur["brief"]
+        cur["brief"] = brief
+        cur.pop("brief_failed_at", None)
+        db.save_report(cur, task_id="")
+        return brief
 
 
 def refine_section(report_id: str, section_id: str, annotations: List[str]) -> Dict[str, Any]:
@@ -241,99 +449,146 @@ def refine_section(report_id: str, section_id: str, annotations: List[str]) -> D
         digest_lines.append(f"[{e.get('evidence_id')}|{e.get('domain','')}] {e.get('title','')}：{e.get('excerpt','')}")
     digest = "\n".join(digest_lines)
     note_text = "\n".join(f"- {a}" for a in annotations if a)
-    existing = "\n".join(target.get("paragraphs", []))
-
-    try:
-        data = chat_json(
-            [
-                {"role": "system", "content": (
-                    "你是资深竞品分析师。用户对报告某章节提出了批注/进一步调研诉求，"
-                    "请基于已有证据与批注，把该章节重写得更深、更厚、更有针对性——补充论证、数据、对比与独立判断。"
-                    '输出 JSON：{"paragraphs":["段落"],"key_takeaway":"核心判断","highlights":["亮点"]}。只输出 JSON。'
-                )},
-                {"role": "user", "content": (
-                    f"章节标题：{target.get('title','')}\n调研主题：{query}\n竞品：{'、'.join(brands)}\n"
-                    f"用户批注/诉求：\n{note_text}\n\n现有章节内容：\n{existing}\n\n可用证据：\n{digest}"
-                )},
-            ],
-            max_tokens=6000, temperature=0.7,
-            model=_model("core"), purpose=f"按批注深化章节：{target.get('title','')}",
-        )
-        if isinstance(data, dict) and data.get("paragraphs"):
-            paras = [str(p).strip() for p in data["paragraphs"] if str(p).strip()]
-            if paras:
-                target["paragraphs"] = paras
-                if data.get("key_takeaway"):
-                    target["key_takeaway"] = str(data["key_takeaway"])
-                hl = data.get("highlights")
-                if isinstance(hl, list):
-                    target["highlights"] = [str(h) for h in hl if str(h).strip()]
-                target["refined"] = True
-                db.save_report(rep, task_id="")
-                return {"ok": True, "section": target}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "message": str(e)}
+    system_prompt = (
+        "你是资深竞品分析师。用户对报告某章节提出了批注/进一步调研诉求，"
+        "请基于已有证据与批注，把该章节重写得更深、更厚、更有针对性——补充论证、数据、对比与独立判断。"
+        '输出 JSON：{"paragraphs":["段落"],"key_takeaway":"核心判断","highlights":["亮点"]}。只输出 JSON。'
+    )
+    user_digest = (
+        f"调研主题：{query}\n竞品：{'、'.join(brands)}\n"
+        f"用户批注/诉求：\n{note_text}\n\n现有章节内容：\n"
+        + "\n".join(target.get("paragraphs", []))
+        + f"\n\n可用证据：\n{digest}"
+    )
+    _rewrite_section(
+        target,
+        {"digest": user_digest, "absorbed_evidence_ids": [e.get("evidence_id") for e in evidence[:24]]},
+        system_prompt,
+    )
+    if target.get("refined"):
+        db.save_report(rep, task_id="")
+        return {"ok": True, "section": target}
     return {"ok": False, "message": "refine failed"}
 
 
-def _clarify_questions(query: str) -> List[Dict[str, Any]]:
-    """LLM 先做「领域识别 + 竞品发现」，再生成澄清问卷。
+def create_refine_task(report_id: str, evidence_ids: Optional[List[str]] = None,
+                       min_cred: float = 70) -> Dict[str, Any]:
+    """创建「基于新证据精修报告」的后台任务（kind='refine'）。
 
-    关键改进（解决「调研 Trae 结果只讲 Trae 不讲竞品」）：
-    - 先判定调研对象到底是什么、属于什么领域；
-    - 自动发现尽可能多的候选竞品，作为多选项让用户在问卷里勾选确认；
-    - 仍保留维度/市场/用户/时间/视角等澄清问题。
+    复用 runner 的「任务即一等实体」机制：前端用返回的 taskId 订阅
+    GET /api/tasks/{taskId}/stream 即可获得进度/取消/重连。
     """
-    scope = _discover_scope(query)
-    subject = scope.get("subject") or query
-    domain = scope.get("domain") or ""
-    competitors = scope.get("competitors") or []
+    tid = _sid("rt")
+    db.save_task(
+        tid,
+        query=report_id,
+        clarifications={
+            "report_id": report_id,
+            "evidence_ids": evidence_ids,
+            "min_cred": min_cred,
+        },
+        kind="refine",
+    )
+    return {"taskId": tid}
 
-    questions: List[Dict[str, Any]] = []
-    # 0) 领域 + 调研对象确认（让用户一眼看到「我们理解的是什么」）
-    if domain:
-        questions.append({
-            "id": "scope",
-            "question": f"我们识别到你要调研的是「{subject}」，所属领域：{domain}。是否准确？",
-            "type": "single",
-            "options": ["准确，继续", "大致准确，下面补充", "不准确，我在下方说明"],
-            "hint": "若不准确，请在最后一题补充说明真实的调研对象与领域。",
-        })
-    # 1) 竞品确认（自动发现的候选 + 让用户勾选/增补）—— 这是核心改进
-    if competitors:
-        questions.append({
-            "id": "competitors",
-            "question": f"为「{subject}」自动发现了以下候选竞品，请勾选你希望重点对比的对象（可多选）：",
-            "type": "multi",
-            "options": competitors[:12],
-            "hint": "勾选后我们会确保每个竞品都被充分调研；如有遗漏可在最后一题补充。",
-        })
 
-    # 2-6) 维度 / 市场 / 用户 / 时间 / 视角 / 补充
-    questions.extend([
-        {"id": "focus", "question": "本次调研最看重哪些维度？（可多选）", "type": "multi",
-         "options": ["功能对比", "定价策略", "用户口碑", "市场份额", "SWOT", "舆情趋势",
-                     "技术架构", "增长趋势", "商业模式", "生态壁垒"]},
-        {"id": "perspective", "question": "你希望以什么视角来产出这份报告？", "type": "single",
-         "options": ["产品经理（PM）", "运营（OPS）", "销售", "用户/消费者", "投资人", "通用/综合"],
-         "hint": "不同视角会额外生成针对性板块，如销售视角附『销售话术与卖点』、投资人视角附『增长与壁垒研判』。"},
-        {"id": "market", "question": "希望聚焦的目标市场或地区？", "type": "single",
-         "options": ["中国大陆", "全球", "北美", "东南亚", "欧洲", "不限"]},
-        {"id": "user", "question": "目标用户群体是？", "type": "single",
-         "options": ["个人用户", "中小团队", "大型企业", "开发者", "学生教育", "不限"]},
-        {"id": "freshness", "question": "是否优先关注最新动态？", "type": "single",
-         "options": ["优先最新（近一月）", "近一年即可", "不限时间"]},
-        {"id": "extra", "question": "还有哪些特定竞品、背景或纠正需要我们关注？（选填）",
-         "type": "text", "options": []},
-    ])
-    return questions
+async def refine_report_pipeline(task_id: str) -> "AsyncIterator[Dict[str, Any]]":
+    """异步生成器：基于新补充的高可信度证据，逐章重写报告正文。
+
+    与 run_pipeline 同一事件协议（progress / done / error）；由 runner._drive 驱动。
+    阻塞的 LLM 调用经 asyncio.to_thread 包裹，不冻结事件循环（P1-2）。
+    """
+    task = db.get_task(task_id) or {}
+    clar = task.get("clarifications", {}) or {}
+    report_id = clar.get("report_id") or task.get("query")
+    evidence_ids = clar.get("evidence_ids") or None
+    min_cred = clar.get("min_cred", 70)
+    rep = db.get_report(report_id)
+    if not rep:
+        yield _ev("error", {"message": "report not found"})
+        return
+
+    evs = rep.get("evidence", []) or []
+    new_evs = [
+        e for e in evs
+        if (e.get("credibility") or 0) >= min_cred
+        and (not evidence_ids or e.get("evidence_id") in set(evidence_ids))
+    ]
+    if not new_evs:
+        yield _ev("error", {"message": "没有可吸收的高可信度证据"})
+        return
+
+    digest_lines = []
+    absorbed = []
+    for e in new_evs:
+        absorbed.append(e.get("evidence_id"))
+        digest_lines.append(
+            f"[{e.get('evidence_id')}|{e.get('domain','')}] {e.get('title','')}：{e.get('excerpt','')}"
+        )
+    digest = "\n".join(digest_lines)[:3000]
+    system_prompt = (
+        "你是资深竞品分析师。报告已归属了一批新的高可信度证据，请基于这些证据把章节重写得更深、更厚、"
+        "更有针对性——补充论证、数据、对比与独立判断。"
+        '输出 JSON：{"paragraphs":["段落"],"key_takeaway":"核心判断","highlights":["亮点"]}。只输出 JSON。'
+    )
+    sections = rep.get("sections", []) or []
+    total = len(sections)
+    for i, s in enumerate(sections, 1):
+        yield _ev("progress", {
+            "percent": round(i / total * 100) if total else 100,
+            "stage": f"精修第{i}/{total}章",
+            "evidence_count": 0,
+        })
+        await asyncio.to_thread(
+            _rewrite_section,
+            s,
+            {"digest": digest, "absorbed_evidence_ids": absorbed},
+            system_prompt,
+        )
+    db.save_report(rep, task_id="")
+    # 派生数据失效钩子：正文已改写，简报/一页纸精炼随即作废（失效即淘汰）
+    db.invalidate_report_brief(report_id)
+    yield _ev("done", {"reportId": report_id})
+
+
+# ── 竞品发现（LLM 路径 + 正则兜底）────────────────────────
+# 正则兜底用的静态竞品映射（按常见关键词命中，毫秒级、无需 LLM）。
+_FALLBACK_COMPETITOR_MAP: Dict[str, List[str]] = {
+    "trae": ["Cursor", "VS Code", "Windsurf", "Claude Code", "GitHub Copilot"],
+    "cursor": ["Trae", "VS Code", "Windsurf", "Claude Code", "GitHub Copilot"],
+    "vscode": ["Cursor", "Trae", "Windsurf", "JetBrains IDEA"],
+    "windsurf": ["Cursor", "Trae", "VS Code", "Claude Code"],
+    "copilot": ["Cursor", "Trae", "Claude Code", "通义灵码"],
+    "chatgpt": ["Claude", "Gemini", "文心一言", "通义千问", "DeepSeek"],
+    "claude": ["ChatGPT", "Gemini", "文心一言", "通义千问"],
+    "deepseek": ["ChatGPT", "Claude", "Gemini", "通义千问", "豆包"],
+    "gemini": ["ChatGPT", "Claude", "DeepSeek", "文心一言"],
+    "doubao": ["DeepSeek", "文心一言", "通义千问", "豆包"],
+    "notion": ["飞书文档", "语雀", "Confluence", "Obsidian"],
+    "feishu": ["钉钉", "企业微信", "Slack", "Microsoft Teams"],
+    "钉钉": ["飞书", "企业微信", "Slack", "Microsoft Teams"],
+    "企业微信": ["飞书", "钉钉", "Slack"],
+    "slack": ["飞书", "钉钉", "Microsoft Teams", "Discord"],
+    "zoom": ["腾讯会议", "飞书会议", "Microsoft Teams"],
+    "spotify": ["Apple Music", "网易云音乐", "QQ音乐"],
+    "netflix": ["Disney+", "爱奇艺", "腾讯视频", "优酷"],
+}
+_FALLBACK_DOMAIN_MAP: Dict[str, str] = {
+    "代码": "AI 编程工具", "编程": "AI 编程工具", "ide": "AI 编程工具", "ai 编程": "AI 编程工具",
+    "大模型": "大模型/生成式 AI", "生成式": "大模型/生成式 AI", "llm": "大模型/生成式 AI",
+    "调研": "竞品调研/咨询", "竞品": "竞品调研/咨询", "分析": "竞品调研/咨询",
+    "协作文档": "协同办公", "文档": "协同办公", "办公": "协同办公", "im": "协同办公", "即时通讯": "协同办公",
+    "会议": "视频会议", "视频": "视频会议",
+    "音乐": "流媒体音乐", "音频": "流媒体音乐",
+}
 
 
 def _discover_scope(query: str) -> Dict[str, Any]:
-    """领域识别 + 竞品自动发现（前置侦察）。
+    """领域识别 + 竞品自动发现（前置侦察，LLM 路径）。
 
-    返回 {"subject": 调研对象, "domain": 所属领域, "competitors": [候选竞品...]}。
-    用 aux 模型（glm-5.1，已关思考、JSON 稳定）；失败重试一次再正则兜底。
+    返回 {"subject", "domain", "competitors", "fallback"}。
+    用 aux 模型（glm-5.1，已关思考、JSON 稳定）；失败重试一次，
+    仍失败则交由 _discover_scope_fallback 返回正则兜底（fallback=True），绝不抛错。
     """
     msgs = [
         {"role": "system", "content": (
@@ -355,14 +610,49 @@ def _discover_scope(query: str) -> Dict[str, Any]:
             if isinstance(data, dict) and (data.get("subject") or data.get("competitors")):
                 subject = str(data.get("subject") or "").strip()
                 domain = str(data.get("domain") or "").strip()
-                comps = [str(c).strip() for c in (data.get("competitors") or [])
-                         if str(c).strip() and str(c).strip() != subject]
+                comps = [
+                    str(c).strip() for c in (data.get("competitors") or [])
+                    if str(c).strip() and str(c).strip() != subject
+                ]
                 seen = set()
                 comps = [c for c in comps if not (c in seen or seen.add(c))]
-                return {"subject": subject, "domain": domain, "competitors": comps[:12]}
+                return {
+                    "subject": subject, "domain": domain,
+                    "competitors": comps[:12], "fallback": False,
+                }
         except Exception:
             pass
-    return {"subject": "", "domain": "", "competitors": []}
+    # LLM 全失败 → 正则兜底（不抛，保证流程继续）
+    return _discover_scope_fallback(query)
+
+
+def _discover_scope_fallback(query: str) -> Dict[str, Any]:
+    """纯正则 / 静态映射兜底：无 LLM 调用，毫秒级返回。
+
+    命中已知产品 → 给出其常见竞品与推测主体；否则尝试从引号抽取候选。
+    始终返回 fallback=True（提示前端这是自动识别候选，需用户核对）。
+    """
+    q = (query or "").strip()
+    low = q.lower()
+    competitors: List[str] = []
+    subject = ""
+    for key, vals in _FALLBACK_COMPETITOR_MAP.items():
+        if key in low:
+            competitors = [v for v in vals if v.lower() != key]
+            subject = key.title() if key.islower() else key
+            break
+    if not competitors:
+        cand = re.findall(r"[‘’'\"\“\”]([^‘’'\"\“\”]{2,20})[‘’'\"\“\”]", q)
+        competitors = [c.strip() for c in cand if c.strip()]
+    domain = ""
+    for kw, dom in _FALLBACK_DOMAIN_MAP.items():
+        if kw in low:
+            domain = dom
+            break
+    return {
+        "subject": subject, "domain": domain,
+        "competitors": competitors[:12], "fallback": True,
+    }
 
 
 def _plan_research(query: str, clar: Dict[str, Any], max_angles: int = 7) -> Dict[str, Any]:
@@ -511,16 +801,9 @@ def _ev(type_: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _source_type(url: str) -> str:
     d = domain_of(url)
-    if "douyin" in d:
-        return "douyin"
-    if "xiaohongshu" in d or "xhs" in d:
-        return "xiaohongshu"
-    if "bilibili" in d or "b23.tv" in d:
-        return "bilibili"
-    if "weibo" in d:
-        return "weibo"
-    if "zhihu" in d:
-        return "zhihu"
+    plat = classify_platform(url)        # 注册表驱动：社媒平台自动识别
+    if plat:
+        return plat
     if "tieba.baidu" in d or "douban" in d or "v2ex" in d or "reddit" in d or "quora" in d:
         return "zhihu"  # 论坛/问答类归到社区口碑
     # 财报/投关页
@@ -1703,6 +1986,36 @@ def _build_data_grid(section_id: str, analysis: Dict[str, Any],
 
 
 # ── 组装报告 ─────────────────────────────────────────────
+def _make_cover_svg(title: str, brands: List[str]) -> str:
+    """本地生成报告封面（SVG data URL），零外部依赖、永不失败。
+
+    根因修复：原先封面写入 copilot-cn.bytedance.net 外部 AI 生图 URL，
+    浏览器端鉴权/跨域失败 → 列表只显示灰色占位。改为后端确定性生成
+    SVG 封面（品牌色渐变 + 标题 + 品牌行），直接以 data URL 入库，
+    前端 <img> 直接渲染，无网络、无失败。
+    """
+    safe_title = (title or "竞品调研").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if len(safe_title) > 20:
+        safe_title = safe_title[:20] + "…"
+    brand_line = " · ".join(brands[:3]) if brands else "Verda AI"
+    safe_brand = brand_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">'
+        '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+        '<stop offset="0" stop-color="#0f766e"/><stop offset="1" stop-color="#134e4a"/>'
+        '</linearGradient></defs>'
+        '<rect width="800" height="450" fill="url(#g)"/>'
+        '<circle cx="650" cy="80" r="150" fill="#ffffff" opacity="0.06"/>'
+        '<circle cx="110" cy="390" r="90" fill="#ffffff" opacity="0.05"/>'
+        '<text x="48" y="70" fill="#a7f3d0" font-family="sans-serif" font-size="20" letter-spacing="2">VERDA · 竞品调研</text>'
+        f'<text x="46" y="225" fill="#ffffff" font-family="sans-serif" font-size="40" font-weight="700">{safe_title}</text>'
+        f'<text x="48" y="272" fill="#ccfbf1" font-family="sans-serif" font-size="22">{safe_brand}</text>'
+        '<text x="48" y="410" fill="#99f6e4" font-family="sans-serif" font-size="16" opacity="0.85">结论可溯源 · 证据可沉淀</text>'
+        '</svg>'
+    )
+    return "data:image/svg+xml," + urllib.parse.quote(svg)
+
+
 def _assemble_report(query, brands, focus, dispatch, claims, evidences, images,
                      sentiment, charts, sections_text, collect_notes,
                      analysis, metrics, quality_before, quality_after,
@@ -1835,10 +2148,7 @@ def _assemble_report(query, brands, focus, dispatch, claims, evidences, images,
         {"term": "SCP 框架", "definition": "结构(Structure)-行为(Conduct)-绩效(Performance)，产业经济学经典分析范式。", "source": "Bain/Scherer"},
         {"term": "波特五力", "definition": "从现有竞争、新进入者、替代品、买方与供应商议价五个方向量化行业竞争压力。", "source": "Michael Porter"},
     ]
-    cover_brand = "+".join(brands[:3])
-    cover = ("https://copilot-cn.bytedance.net/api/ide/v1/text_to_image?"
-             f"prompt=minimalist%20business%20competitive%20analysis%20report%20cover%2C%20"
-             f"morandi%20sage%20green%2C%20{cover_brand}&image_size=landscape_16_9")
+    cover = _make_cover_svg(title, brands)
 
     evidence_dicts = []
     for e in evidences:
